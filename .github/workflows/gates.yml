@@ -11,7 +11,7 @@ jobs:
   gates:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       # One entry point, and it is the same one `scripts/verify-gates.sh` is
       # when it is run by hand. If CI listed the gates itself the two lists
       # would drift, and the local copy would stop being evidence of anything.
