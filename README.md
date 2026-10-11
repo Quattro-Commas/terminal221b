@@ -1,9 +1,13 @@
+[![CI](https://github.com/Quattro-Commas/terminal221b/actions/workflows/ci.yml/badge.svg)](https://github.com/Quattro-Commas/terminal221b/actions/workflows/ci.yml)
+[![Gates](https://github.com/Quattro-Commas/terminal221b/actions/workflows/gates.yml/badge.svg)](https://github.com/Quattro-Commas/terminal221b/actions/workflows/gates.yml)
+[![CodeQL](https://github.com/Quattro-Commas/terminal221b/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/Quattro-Commas/terminal221b/actions/workflows/github-code-scanning/codeql)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![Node >=22](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)](https://nodejs.org/)
+
 # Terminal221b
 
 Terminal221b is an Expo/React Native chat client and an installable, local-first coding CLI.
 The CLI sends selected workspace text to Anthropic and requires explicit approval before applying a proposed diff.
-
-[![CI](https://github.com/Quattro-Commas/terminal221b/actions/workflows/ci.yml/badge.svg)](https://github.com/Quattro-Commas/terminal221b/actions/workflows/ci.yml)
 
 ## Why it exists
 

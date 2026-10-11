@@ -22,11 +22,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/BoozeLee/terminal221b.git",
+    "url": "https://github.com/Quattro-Commas/terminal221b.git",
     "directory": "packages/cli"
   },
-  "homepage": "https://github.com/BoozeLee/terminal221b",
+  "homepage": "https://github.com/Quattro-Commas/terminal221b",
   "bugs": {
-    "url": "https://github.com/BoozeLee/terminal221b/issues"
+    "url": "https://github.com/Quattro-Commas/terminal221b/issues"
   }
 }

@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "An original local-first Rust TUI for Terminal221b"
 license = "AGPL-3.0-only"
-repository = "https://github.com/BoozeLee/terminal221b"
+repository = "https://github.com/Quattro-Commas/terminal221b"
 
 [[bin]]
 name = "terminal221b-tui"
