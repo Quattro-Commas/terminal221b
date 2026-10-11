@@ -9,6 +9,10 @@
 Terminal221b is an Expo/React Native chat client and an installable, local-first coding CLI.
 The CLI sends selected workspace text to Anthropic and requires explicit approval before applying a proposed diff.
 
+## Demo
+
+![Terminal221b build and test](docs/demo.svg)
+
 ## Why it exists
 
 The mobile app remains a single-screen Claude chat client. Separate TypeScript CLI and Rust TUI packages provide bounded local-workspace context, local security triage, and reviewed patch workflows. The repository does not implement autonomous multi-agent orchestration, blockchain transactions, local TensorRT inference, or an economic loop.
