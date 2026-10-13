@@ -1,5 +1,6 @@
-import { lstat, readdir, readFile, realpath } from 'node:fs/promises';
+import { lstat, readdir, realpath } from 'node:fs/promises';
 import { extname, join, relative, resolve, sep } from 'node:path';
+import { readBoundedFile } from './bounded-read.js';
 
 const ignoredDirectories = new Set([
   '.git',
@@ -105,10 +106,9 @@ export async function collectWorkspaceContext(
       if (!entry.isFile() || isIgnoredFile(entry.name)) continue;
       if (!textExtensions.has(extname(entry.name).toLowerCase())) continue;
 
-      const stat = await lstat(absolutePath);
-      if (stat.size > maxFileBytes || totalBytes + stat.size > maxTotalBytes) continue;
-
-      const content = await readFile(absolutePath, 'utf8');
+      const read = await readBoundedFile(absolutePath, Math.min(maxFileBytes, maxTotalBytes - totalBytes));
+      if (read.kind === 'skipped') continue;
+      const content = read.content;
       if (content.includes('\0')) continue;
 
       const path = relative(root, absolutePath).split(sep).join('/');
