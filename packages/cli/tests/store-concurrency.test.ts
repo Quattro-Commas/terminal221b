@@ -545,3 +545,33 @@ describe('a version 1 store', () => {
     expect((await put(root, signedX)).revision).toBe(2);
   });
 });
+
+describe('no lock-free write reaches an unfenced store', () => {
+  it('fences a fresh store at init', async () => {
+    const root = scratch('fence-fresh');
+    await initStore(root, FIXTURE_NOW);
+    expect(statSync(join(root, 'bundles', '.format-v2')).isFile()).toBe(true);
+  });
+
+  it('migrates a version 1 store before put writes anything', async () => {
+    const root = scratch('fence-put');
+    mkdirSync(join(root, 'bundles'), { recursive: true });
+    const spki = publicKey.export({ type: 'spki', format: 'der' }).toString('base64');
+    writeFileSync(
+      join(root, 'manifest.json'),
+      JSON.stringify({ version: 1, trustedKeys: [{ keyId: KEY_ID, publicKeySpkiDerBase64: spki, addedAt: FIXTURE_NOW }] })
+    );
+    await put(root, signedX);
+    expect(readManifest(root).version).toBe(2);
+    expect(statSync(join(root, 'bundles', '.format-v2')).isFile()).toBe(true);
+  });
+
+  it('migrates a version 1 store before a key is trusted', () => {
+    const root = scratch('fence-trust');
+    mkdirSync(join(root, 'bundles'), { recursive: true });
+    writeFileSync(join(root, 'manifest.json'), JSON.stringify({ version: 1, trustedKeys: [] }));
+    trustKey(root, { keyId: KEY_ID, publicKey }, FIXTURE_NOW);
+    expect(statSync(join(root, 'bundles', '.format-v2')).isFile()).toBe(true);
+  });
+});
+

@@ -520,7 +520,8 @@ describe('accepting a bundle', () => {
     await initStore(root, FIXTURE_NOW);
     trustKey(root, { keyId: KEY_ID, publicKey }, FIXTURE_NOW);
     await putBundle(root, unsignedFixture, { now: FIXTURE_NOW, baseDir: baseDir() }).catch(() => undefined);
-    expect(readdirSync(join(root, 'bundles'))).toEqual([]);
+    // The format fence is not a written bundle, so dot-files are not counted.
+    expect(readdirSync(join(root, 'bundles')).filter((name) => !name.startsWith('.'))).toEqual([]);
   });
 
   it('stores a fully signed and digest-verified bundle', async () => {

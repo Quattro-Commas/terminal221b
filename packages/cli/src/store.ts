@@ -237,6 +237,7 @@ export async function initStore(root: string, now: string, context?: StoreContex
   for (const dir of [paths.bundles, paths.objects, paths.keys, paths.transitionsDir]) {
     mkdirSync(dir, { recursive: true });
   }
+  createExclusive(runtime, join(paths.bundles, FORMAT_FENCE), FENCE_BYTES);
   runtime.step('init:before-manifest');
   const fresh = createExclusive(
     runtime,
@@ -250,6 +251,18 @@ export async function initStore(root: string, now: string, context?: StoreContex
   const frozen = frozenKeysOfV1(paths);
   if (frozen !== undefined) migrateStore(paths, frozen, now, runtime);
   return paths;
+}
+
+/**
+ * Every writer calls this first. A version 1 store may still be written by an
+ * old CLI that trusts its pid lock, and a lock-free writer landing there would
+ * have its claimed revision replaced by that CLI's rename. Upgrading (which
+ * fences old binaries out) before the first write closes that gap, so no
+ * lock-free write path can reach a store that is not fenced.
+ */
+function upgradeIfV1(paths: StorePaths, now: string, runtime: StoreRuntime): void {
+  const frozen = existsSync(paths.manifest) ? frozenKeysOfV1(paths) : undefined;
+  if (frozen !== undefined) migrateStore(paths, frozen, now, runtime);
 }
 
 /** The base key list if the manifest is still version 1, otherwise undefined (including while it is mid-write). */
@@ -348,6 +361,7 @@ export function trustKey(
 ): TrustedKey {
   const paths = storePaths(root);
   const runtime = resolveContext(context);
+  upgradeIfV1(paths, now, runtime);
   const alreadyTrusted = () =>
     new Error(`keyId ${key.keyId} is already trusted; choose another keyId or remove the entry first`);
   if (readManifest(root).trustedKeys.some((entry) => entry.keyId === key.keyId)) throw alreadyTrusted();
@@ -389,7 +403,7 @@ export function trustKey(
  * honours. (The version number fences it as well: an old readManifest rejects 2.)
  * Entry names cannot collide with it, because they must start alphanumeric.
  */
-export function migrateStore(
+function migrateStore(
   paths: StorePaths,
   frozenKeys: TrustedKey[],
   now: string,
@@ -973,6 +987,7 @@ export async function putBundle(root: string, bundle: CaseBundle, options: PutOp
   const bundleDigest = sha256(serialized);
 
   const runtime = resolveContext(options.context);
+  upgradeIfV1(paths, options.now, runtime);
   const bytes = Buffer.from(serialized, 'utf8');
   ensureObject(runtime, paths, bundleDigest, bytes);
   await runtime.step('put:object-written');
@@ -1082,7 +1097,7 @@ export function listEntries(root: string, runtime: StoreRuntime = resolveContext
     if (!existsSync(join(paths.bundles, name))) continue;
     listed.push({ name, revisions: listRevisions(runtime, paths, name) });
   }
-  const transitions = readTransitions(root);
+  const transitions = readTransitionLog(root, runtime).transitions;
   const entries: StoreEntry[] = [];
   for (const { name, revisions } of listed) {
     for (const revision of revisions) {
@@ -1421,6 +1436,7 @@ export function purgeExpired(
     );
   }
 
+  upgradeIfV1(paths, now, runtime);
   const digestOf = new Map(
     listEntries(root, runtime).map((stored) => [`${stored.entry}@${stored.revision}`, stored.bundleDigest])
   );
@@ -1578,6 +1594,7 @@ export function saveRetentionPolicy(
 ): { path: string; overwritten: boolean } {
   const paths = storePaths(root);
   const runtime = resolveContext(context);
+  upgradeIfV1(paths, now, runtime);
   const at = retentionPolicyPath(paths);
   const existing = existsSync(at);
   mkdirSync(paths.root, { recursive: true });
