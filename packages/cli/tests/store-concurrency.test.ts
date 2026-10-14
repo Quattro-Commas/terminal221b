@@ -393,11 +393,35 @@ describe('the exclusive-create fallback', () => {
 });
 
 describe('the transition log', () => {
-  it('throws on a short append write instead of recording half a line', async () => {
+  it('completes a partial write instead of treating it as failure', async () => {
+    const root = scratch('partial-write');
+    // writeSync may legitimately write fewer bytes than asked; 3 at a time.
+    await initStore(root, FIXTURE_NOW, {
+      io: { writeSome: (fd, buf, offset, length) => nodeIO.writeSome(fd, buf, offset, Math.min(3, length)) },
+    });
+    expect(readTransitions(root).map((line) => line.action)).toEqual(['init']);
+    expect(readTransitionLog(root).unreadable).toEqual([]);
+  });
+
+  it('fails when the bytes cannot be written, and says how far it got', async () => {
     const root = scratch('short-write');
+    let calls = 0;
     await expect(
-      initStore(root, FIXTURE_NOW, { io: { appendLine: (_path, line) => line.length - 1 } })
-    ).rejects.toThrow(/short write/);
+      initStore(root, FIXTURE_NOW, {
+        io: { writeSome: (fd, buf, offset) => (calls++ === 0 ? nodeIO.writeSome(fd, buf, offset, 2) : 0) },
+      })
+    ).rejects.toThrow(/short write.*wrote 2 of/);
+  });
+
+  it('fsyncs the per-writer log after the append', async () => {
+    const root = scratch('append-fsync');
+    const synced: number[] = [];
+    await initStore(root, FIXTURE_NOW, {
+      io: { fsync: (fd) => { synced.push(fd); nodeIO.fsync(fd); } },
+    });
+    expect(synced.length).toBeGreaterThan(0);
+    const log = readdirSync(join(root, 'transitions.d'))[0];
+    expect(readFileSync(join(root, 'transitions.d', log), 'utf8')).toContain('"action":"init"');
   });
 
   it('parses a new append after a torn last line, and reports the tear', async () => {

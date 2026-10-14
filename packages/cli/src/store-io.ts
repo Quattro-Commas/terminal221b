@@ -45,8 +45,12 @@ export interface StoreIO {
   openExcl(path: string, bytes: Buffer): void;
   rename(from: string, to: string): void;
   unlink(path: string): void;
-  /** One `writeSync` on an append-mode fd (`create` makes it exclusive). Returns the bytes written. */
-  appendLine(path: string, line: Buffer, create: boolean): number;
+  /** Opens `path` for appending (`create` makes it exclusive) and returns the fd. */
+  openAppend(path: string, create: boolean): number;
+  /** One `writeSync`; may write fewer bytes than asked. Returns the bytes written. */
+  writeSome(fd: number, buffer: Buffer, offset: number, length: number): number;
+  fsync(fd: number): void;
+  close(fd: number): void;
   readdir(path: string): string[];
   readFile(path: string): Buffer;
   stat(path: string): FileStat;
@@ -68,16 +72,10 @@ export const nodeIO: StoreIO = {
   },
   rename: (from, to) => renameSync(from, to),
   unlink: (path) => unlinkSync(path),
-  appendLine(path, line, create) {
-    const fd = openSync(path, create ? 'ax' : 'a');
-    try {
-      const written = writeSync(fd, line);
-      if (written === line.length) fsyncSync(fd);
-      return written;
-    } finally {
-      closeSync(fd);
-    }
-  },
+  openAppend: (path, create) => openSync(path, create ? 'ax' : 'a'),
+  writeSome: (fd, buffer, offset, length) => writeSync(fd, buffer, offset, length),
+  fsync: (fd) => fsyncSync(fd),
+  close: (fd) => closeSync(fd),
   readdir: (path) => readdirSync(path),
   readFile: (path) => readFileSync(path),
   stat(path) {
@@ -270,9 +268,27 @@ export function frameLine(json: string): Buffer {
   return Buffer.from(`\n${json}\n`, 'utf8');
 }
 
+/**
+ * Appends `line` completely and fsyncs. `writeSync` may write fewer bytes than
+ * asked without anything being wrong, so this loops until everything is out and
+ * fails only when a write makes no progress (or errors). A crash part-way still
+ * leaves at most a torn last line, which the next record's leading newline and
+ * the tolerant reader absorb.
+ */
 export function appendWhole(runtime: StoreRuntime, path: string, line: Buffer, create: boolean): void {
-  const written = runtime.io.appendLine(path, line, create);
-  if (written !== line.length) {
-    throw new Error(`short write appending to ${path}: wrote ${written} of ${line.length} bytes`);
+  const { io } = runtime;
+  const fd = io.openAppend(path, create);
+  try {
+    let written = 0;
+    while (written < line.length) {
+      const n = io.writeSome(fd, line, written, line.length - written);
+      if (n <= 0) {
+        throw new Error(`short write appending to ${path}: wrote ${written} of ${line.length} bytes`);
+      }
+      written += n;
+    }
+    io.fsync(fd);
+  } finally {
+    io.close(fd);
   }
 }
