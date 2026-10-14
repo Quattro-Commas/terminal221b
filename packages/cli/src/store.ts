@@ -20,6 +20,7 @@
 import {
   createHash,
   createPrivateKey,
+  randomBytes,
   createPublicKey,
   sign as cryptoSign,
   verify as cryptoVerify,
@@ -31,6 +32,7 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -252,55 +254,110 @@ function basenameOf(path: string): string {
 }
 
 /**
- * A cooperative lock: advisory, taken by writing our pid, released by removing
- * it. Two concurrent `put`s in the same store would otherwise both compute the
- * next revision from the same on-disk state and one would overwrite the other.
+ * A cooperative lock: advisory, taken by linking a file holding our pid and a
+ * random token into place, released only by its holder. Two concurrent `put`s in
+ * the same store would otherwise both compute the next revision from the same
+ * on-disk state and one would overwrite the other.
  */
 export function withStoreLock<T>(paths: StorePaths, body: () => T): T {
   mkdirSync(paths.root, { recursive: true });
-  takeLock(paths.lock);
+  const token = takeLock(paths.lock);
   try {
     return body();
   } finally {
-    rmSync(paths.lock, { force: true });
+    releaseLock(paths.lock, token);
   }
 }
 
+const LOCK_ATTEMPTS = 5;
+
 /**
- * Takes the lock with an exclusive create, so two processes can never both
- * believe they hold it (an exists-check followed by a write let both through).
- * A lock whose holder is gone is removed and the exclusive create tried once
- * more. What is left: two processes taking over the same stale lock at the same
- * moment can still race on its removal; that needs a stale lock to exist first.
+ * Takes the lock and returns the token that proves we hold it.
+ *
+ * The lock file appears atomically and already complete: the token is written to a
+ * private temp file which is then hard-linked to the lock path, so `link` either
+ * creates the lock with our token in it or fails with EEXIST. (Creating the file
+ * and then writing the pid let another process read an empty lock and take it
+ * over as stale while its holder was alive.)
+ *
+ * A lock whose holder is gone is moved aside under a unique name, and deleted only
+ * if what was moved is still the dead holder's lock; if a live lock was moved by
+ * mistake it is linked back. What is left is a narrow race that needs a stale lock
+ * and three processes at once; release still never deletes a lock it does not own.
  */
-function takeLock(lock: string): void {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      writeFileSync(lock, `${process.pid}\n`, { flag: 'wx' });
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+function takeLock(lock: string): string {
+  const token = `${process.pid}:${randomBytes(8).toString('hex')}`;
+  const temp = `${lock}.${token.replace(':', '-')}.tmp`;
+  writeFileSync(temp, `${token}\n`, { flag: 'wx' });
+  try {
+    for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt += 1) {
+      try {
+        linkSync(temp, lock);
+        return token;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+      const holder = readLockHolder(lock);
+      if (holder === undefined) continue; // released meanwhile: try again
+      if (holderIsAlive(holder)) {
+        throw new Error(`the case store is locked by process ${holder.split(':')[0] || holder}`);
+      }
+      removeStaleLock(lock, holder, token);
     }
-    let holder: string;
-    try {
-      holder = readFileSync(lock, 'utf8').trim();
-    } catch {
-      continue; // released between our create and this read: try the create again
-    }
-    if (/^\d+$/.test(holder) && isProcessAlive(Number(holder))) {
-      throw new Error(`the case store is locked by process ${holder}`);
-    }
-    rmSync(lock, { force: true });
+    throw new Error('the case store lock could not be taken: it kept changing hands');
+  } finally {
+    rmSync(temp, { force: true });
   }
-  throw new Error('the case store lock could not be taken');
+}
+
+function releaseLock(lock: string, token: string): void {
+  // Only our own lock: if it was taken over, deleting it would free someone else's.
+  if (readLockHolder(lock) === token) rmSync(lock, { force: true });
+}
+
+function readLockHolder(lock: string): string | undefined {
+  try {
+    return readFileSync(lock, 'utf8').trim();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+function holderIsAlive(holder: string): boolean {
+  const pid = /^(\d+)(?::|$)/.exec(holder)?.[1];
+  return pid !== undefined && isProcessAlive(Number(pid));
+}
+
+function removeStaleLock(lock: string, staleHolder: string, token: string): void {
+  const aside = `${lock}.stale-${token.replace(':', '-')}`;
+  try {
+    renameSync(lock, aside);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; // someone else moved it
+    throw error;
+  }
+  if (readLockHolder(aside) === staleHolder) {
+    rmSync(aside, { force: true });
+    return;
+  }
+  // We moved a lock that is not the stale one we read: put it back.
+  try {
+    linkSync(aside, lock);
+  } catch {
+    // The slot was taken again meanwhile; leave it to its owner's release check,
+    // which will find the lock is no longer theirs.
+  }
+  rmSync(aside, { force: true });
 }
 
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    // EPERM: the process exists but belongs to another user. Only ESRCH means gone.
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
   }
 }
 

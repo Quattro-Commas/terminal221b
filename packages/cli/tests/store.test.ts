@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { generateKeyPairSync, createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseCaseBundle } from '../src/case.js';
@@ -430,7 +430,8 @@ describe('store root and layout', () => {
     const walk = (dir: string): void => {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         const at = join(dir, entry.name);
-        if (entry.isDirectory()) walk(at);
+        // Dirents do not follow symlinks; a linked directory is still walked.
+        if (entry.isDirectory() || (entry.isSymbolicLink() && statSync(at).isDirectory())) walk(at);
         else expect(readFileSync(at, 'utf8')).not.toContain(marker);
       }
     };
@@ -1137,14 +1138,48 @@ describe('the store lock', () => {
     expect(withStoreLock(paths, () => 'after')).toBe('after');
   });
 
-  it('takes over a lock left by a process that is gone', () => {
+  it('takes over a lock left by a process that is gone, in either lock format', () => {
     const paths = storePaths(scratchRoot('lock-stale'));
     mkdirSync(paths.root, { recursive: true });
-    for (const holder of ['999999999\n', 'not a pid\n']) {
+    for (const holder of ['999999999\n', '999999999:abcd\n', 'not a pid\n', '']) {
       writeFileSync(paths.lock, holder);
-      expect(withStoreLock(paths, () => readFileSync(paths.lock, 'utf8'))).toBe(`${process.pid}\n`);
+      const held = withStoreLock(paths, () => readFileSync(paths.lock, 'utf8'));
+      expect(held).toMatch(new RegExp(`^${process.pid}:[0-9a-f]{16}\\n$`));
       expect(existsSync(paths.lock)).toBe(false);
     }
+  });
+
+  it('never deletes a lock it no longer owns', () => {
+    const paths = storePaths(scratchRoot('lock-owner'));
+    withStoreLock(paths, () => {
+      // Someone else's lock now sits at the path (as after a takeover).
+      writeFileSync(paths.lock, '999999999:feedfacefeedface\n');
+    });
+    expect(readFileSync(paths.lock, 'utf8')).toBe('999999999:feedfacefeedface\n');
+  });
+
+  it('treats a holder owned by another user as alive', () => {
+    // process.kill(pid, 0) throws EPERM for a live process of another user.
+    const paths = storePaths(scratchRoot('lock-eperm'));
+    mkdirSync(paths.root, { recursive: true });
+    writeFileSync(paths.lock, '424242:0123456789abcdef\n');
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+    });
+    try {
+      expect(() => withStoreLock(paths, () => 'taken')).toThrow(/locked by process 424242/);
+    } finally {
+      kill.mockRestore();
+    }
+    expect(readFileSync(paths.lock, 'utf8')).toBe('424242:0123456789abcdef\n');
+  });
+
+  it('leaves no temp or stale files behind', () => {
+    const paths = storePaths(scratchRoot('lock-clean'));
+    mkdirSync(paths.root, { recursive: true });
+    writeFileSync(paths.lock, '999999999\n');
+    withStoreLock(paths, () => undefined);
+    expect(readdirSync(paths.root).filter((n) => n.includes('.lock') || n.endsWith('.tmp'))).toEqual([]);
   });
 
   it('initStore never truncates the transitions already recorded', async () => {
