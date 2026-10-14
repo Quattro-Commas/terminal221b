@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { generateKeyPairSync, createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseCaseBundle } from '../src/case.js';
@@ -426,9 +426,9 @@ describe('store root and layout', () => {
     const pem = privateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
     const marker = pem.split('\n')[1];
     const walk = (dir: string): void => {
-      for (const name of readdirSync(dir)) {
-        const at = join(dir, name);
-        if (statSync(at).isDirectory()) walk(at);
+      for (const dirent of readdirSync(dir, { withFileTypes: true })) {
+        const at = join(dir, dirent.name);
+        if (dirent.isDirectory()) walk(at);
         else expect(readFileSync(at, 'utf8')).not.toContain(marker);
       }
     };

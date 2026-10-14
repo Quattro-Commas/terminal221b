@@ -35,7 +35,7 @@ import {
   trustKey,
   verifyStore,
 } from '../src/store.js';
-import { createExclusive, nodeIO, resolveContext, type StoreContext } from '../src/store-io.js';
+import { createExclusive, nodeIO, resolveContext, writeDurable, type StoreContext } from '../src/store-io.js';
 
 /*
  * These tests drive the races the lock-free store is designed around. Each one
@@ -351,6 +351,19 @@ describe('createExclusive', () => {
     const notBytes = { length: 1 } as unknown as Buffer;
     expect(() => nodeIO.openExcl(join(dir, 'a.json'), notBytes)).toThrow();
     expect(readdirSync(dir)).toEqual([]);
+  });
+});
+
+describe('writeDurable', () => {
+  it('does not let a failing temp cleanup mask the rename error', () => {
+    const dir = scratch('durable-unlink-masks');
+    const runtime = resolveContext({
+      io: {
+        rename: () => { throw errno('ENOSPC'); },
+        unlink: () => { throw errno('EIO'); },
+      },
+    });
+    expect(() => writeDurable(runtime, join(dir, 'a.json'), 'x')).toThrow(/ENOSPC/);
   });
 });
 

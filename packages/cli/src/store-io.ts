@@ -174,7 +174,13 @@ export function writeDurable(runtime: StoreRuntime, path: string, bytes: Buffer 
     runtime.io.openExcl(temp, Buffer.from(bytes));
     runtime.io.rename(temp, target);
   } catch (error) {
-    removeIfPresent(runtime.io, temp);
+    // Best effort: a failed cleanup must not replace the error that got us here.
+    // A stranded temp is a leftover that verify reports.
+    try {
+      removeIfPresent(runtime.io, temp);
+    } catch {
+      // see above
+    }
     throw error;
   }
   fsyncDir(parent);
