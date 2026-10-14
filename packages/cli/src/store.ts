@@ -1051,16 +1051,36 @@ export async function getBundle(
 ): Promise<GetResult> {
   const paths = storePaths(root);
   const revisions = listRevisions(resolveContext(), paths, entry);
+  const transitions = readTransitions(root);
   if (revisions.length === 0) {
     throw new Error(`the store holds no revisions of ${entry}`);
   }
-  const target = revision ?? revisions[revisions.length - 1];
+  const vouched = revisions.filter((n) => transitions.some((line) => isVouching(line, entry, n)));
+  // Without an explicit revision the answer is the newest one a transition
+  // vouches for. The newest file may be a put still in flight, or one that
+  // crashed before recording itself, and serving it would hand out bytes
+  // nothing vouches for.
+  if (revision === undefined && vouched.length === 0) {
+    throw new Error(
+      `${entry} has revision file(s) ${revisions.join(', ')} but no transition vouches for any of them; a write may be in flight or incomplete`
+    );
+  }
+  const target = revision ?? vouched[vouched.length - 1];
   if (!revisions.includes(target)) {
     throw new Error(`the store holds no revision ${target} of ${entry}; it has ${revisions.join(', ')}`);
   }
   const manifest = readManifest(root);
   const stored = readFileSync(bundlePathFor(paths, entry, target), 'utf8');
-  const bundle = parseCaseBundle(JSON.parse(stored));
+  let bundle: CaseBundle;
+  try {
+    bundle = parseCaseBundle(JSON.parse(stored));
+  } catch (error) {
+    throw new Error(
+      vouched.includes(target)
+        ? `revision ${target} of ${entry} is corrupt: ${(error as Error).message}`
+        : `revision ${target} of ${entry} is incomplete or unvouched (no transition records it; a write may be in flight)`
+    );
+  }
   const signatures = verifyBundleSignatures(bundle, trustedKeyObjects(manifest));
   const sources = await checkSourceDigests(bundle, options);
   const problems = [
@@ -1077,19 +1097,31 @@ export async function getBundle(
   return { entry, revision: target, bundle, report };
 }
 
+function isVouching(line: Transition, entry: string, revision: number): boolean {
+  return line.action === 'put' && line.entry === entry && line.revision === revision && !!line.bundleDigest;
+}
+
+/**
+ * Revision files are listed BEFORE the transition log is read. A put appends its
+ * transition after creating the revision file, so this order can only err toward
+ * "file seen, transition not yet" (reported unvouched), never toward a vouched
+ * revision whose file we did not list. The reverse order could hide a revision
+ * that was fully written in between.
+ */
 export function listEntries(root: string, runtime: StoreRuntime = resolveContext()): StoreEntry[] {
   const paths = storePaths(root);
   if (!existsSync(paths.bundles)) return [];
-  const transitions = readTransitions(root);
-  const entries: StoreEntry[] = [];
+  const listed: { name: string; revisions: number[] }[] = [];
   for (const name of readdirSync(paths.bundles).sort()) {
     if (name.startsWith('.')) continue;
-    const dir = join(paths.bundles, name);
-    if (!existsSync(dir)) continue;
-    for (const revision of listRevisions(runtime, paths, name)) {
-      const recorded = transitions.find(
-        (line) => line.entry === name && line.revision === revision && line.bundleDigest
-      );
+    if (!existsSync(join(paths.bundles, name))) continue;
+    listed.push({ name, revisions: listRevisions(runtime, paths, name) });
+  }
+  const transitions = readTransitions(root);
+  const entries: StoreEntry[] = [];
+  for (const { name, revisions } of listed) {
+    for (const revision of revisions) {
+      const recorded = transitions.find((line) => isVouching(line, name, revision));
       entries.push({
         entry: name,
         revision,
@@ -1099,6 +1131,44 @@ export function listEntries(root: string, runtime: StoreRuntime = resolveContext
     }
   }
   return entries;
+}
+
+const LEFTOVER = /\.tmp-|^\.condemned-/;
+
+/**
+ * Temp and condemned files are what an interrupted write or purge leaves. Readers
+ * ignore them; this reports them so they do not accumulate unseen. There is
+ * deliberately no cleanup command and no age threshold: a file this old or new
+ * could still belong to a live writer, and the store has no clock it trusts.
+ * Because of that, verify run during a write can also report that write's temp
+ * file, or a revision a put has created but not yet recorded: both are
+ * transient and disappear on the next run.
+ */
+function findLeftovers(paths: StorePaths, runtime: StoreRuntime): string[] {
+  const dirs = [paths.root, paths.bundles, paths.objects, paths.keys, paths.transitionsDir];
+  try {
+    for (const name of runtime.io.readdir(paths.bundles)) {
+      if (!name.startsWith('.')) dirs.push(join(paths.bundles, name));
+    }
+  } catch (error) {
+    if (errnoCode(error) !== 'ENOENT' && errnoCode(error) !== 'ENOTDIR') throw error;
+  }
+  const out: string[] = [];
+  for (const dir of dirs) {
+    let names: string[];
+    try {
+      names = runtime.io.readdir(dir);
+    } catch (error) {
+      if (errnoCode(error) === 'ENOENT' || errnoCode(error) === 'ENOTDIR') continue;
+      throw error;
+    }
+    for (const name of names.sort()) {
+      if (LEFTOVER.test(name)) {
+        out.push(`leftover ${relative(paths.root, join(dir, name)) || name}: an interrupted write or purge left it behind`);
+      }
+    }
+  }
+  return out;
 }
 
 /** Re-checks every stored bundle against the manifest keys and the local bytes. */
@@ -1112,9 +1182,19 @@ export async function verifyStore(
   const problems: string[] = [];
   const allSources: SourceVerification[] = [];
   const allSignatures: SignatureReport[] = [];
-  const entries = listEntries(root);
+  const runtime = resolveContext();
+  const entries = listEntries(root, runtime);
+  problems.push(...readTransitionLog(root, runtime).unreadable.map((line) => `unreadable transition line in ${line}`));
+  problems.push(...readKeyDirectory(root, runtime).problems);
+  problems.push(...findLeftovers(paths, runtime));
   for (const entry of entries) {
-    const stored = readFileSync(bundlePathFor(paths, entry.entry, entry.revision), 'utf8');
+    let stored: string;
+    try {
+      stored = readFileSync(bundlePathFor(paths, entry.entry, entry.revision), 'utf8');
+    } catch (error) {
+      if (errnoCode(error) === 'ENOENT') continue; // purged since it was listed
+      throw error;
+    }
     const digest = sha256(stored);
     if (entry.bundleDigest === undefined) {
       problems.push(
@@ -1129,7 +1209,17 @@ export async function verifyStore(
         problems.push(`${entry.entry} revision ${entry.revision} has no intact stored object`);
       }
     }
-    const bundle = parseCaseBundle(JSON.parse(stored));
+    let bundle: CaseBundle;
+    try {
+      bundle = parseCaseBundle(JSON.parse(stored));
+    } catch (error) {
+      problems.push(
+        entry.bundleDigest === undefined
+          ? `${entry.entry} revision ${entry.revision} is incomplete or unvouched: it does not parse and no transition records it (a write may be in flight)`
+          : `${entry.entry} revision ${entry.revision} is corrupt: ${(error as Error).message}`
+      );
+      continue;
+    }
     problems.push(...validateCaseBundle(bundle).map((line) => `${entry.entry}@${entry.revision}: ${line}`));
     const sources = await checkSourceDigests(bundle, options);
     problems.push(...sourceMismatchProblems(sources).map((line) => `${entry.entry}@${entry.revision}: ${line}`));
@@ -1266,7 +1356,15 @@ export function retentionReport(root: string, windows: RetentionWindows, now: st
 
   const rows: RetentionRow[] = [];
   for (const stored of listEntries(paths.root)) {
-    const bundle = parseCaseBundle(JSON.parse(readFileSync(bundlePathFor(paths, stored.entry, stored.revision), 'utf8')));
+    let bundle: CaseBundle;
+    try {
+      bundle = parseCaseBundle(JSON.parse(readFileSync(bundlePathFor(paths, stored.entry, stored.revision), 'utf8')));
+    } catch (error) {
+      // Purged since it was listed, or a write still in flight: neither has
+      // anything to report here, and verify is where an unparseable one is named.
+      if (errnoCode(error) === 'ENOENT' || stored.bundleDigest === undefined) continue;
+      throw error;
+    }
     const isNewest = newest.get(stored.entry) === stored.revision;
     for (const source of bundle.sources) {
       const days = windowFor(windows, source.retention);
@@ -1531,11 +1629,12 @@ export function saveRetentionPolicy(
       'A class absent from here is reported unconfigured and is never purged. operator_archive is never purged.',
     windows: ordered as RetentionWindows,
   };
-  writeDurableWith(runtime, at, `${JSON.stringify(file, null, 2)}\n`);
+  const bytes = `${JSON.stringify(file, null, 2)}\n`;
+  writeDurableWith(runtime, at, bytes);
   recordTransition(runtime, paths, {
     at: now,
     action: existing ? 'retention-policy-replaced' : 'retention-policy-recorded',
-    detail: `windows: ${Object.entries(ordered).map(([key, value]) => `${key}=${value}d`).join(', ') || 'none'}`,
+    detail: `windows: ${Object.entries(ordered).map(([key, value]) => `${key}=${value}d`).join(', ') || 'none'}; file ${sha256(bytes)}`,
   });
   return { path: at, overwritten: existing };
 }
