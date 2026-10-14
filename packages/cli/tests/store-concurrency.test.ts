@@ -9,13 +9,13 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  rmSync,
   statSync,
   writeFileSync,
   writeSync,
   closeSync,
   fsyncSync,
 } from 'node:fs';
-import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FIXTURE_NOW, fixtureBundle as unsignedFixture } from '../src/case-fixtures.js';
@@ -733,97 +733,88 @@ describe('a version 1 store', () => {
     expect((await put(root, signedX)).revision).toBe(2);
   });
 
-  describe('while an old CLI is still adding trusted keys', () => {
-    const spki = (key: typeof publicKey) => key.export({ type: 'spki', format: 'der' }).toString('base64');
-    const addV1Key = (root: string, keyId: string) => {
-      const manifest = JSON.parse(readFileSync(join(root, 'manifest.json'), 'utf8')) as {
-        version: number;
-        trustedKeys: unknown[];
-      };
-      manifest.trustedKeys.push({ keyId, publicKeySpkiDerBase64: spki(OTHER.publicKey), addedAt: FIXTURE_NOW });
-      writeFileSync(join(root, 'manifest.json'), JSON.stringify(manifest));
-    };
-
-    it('keeps a key an old CLI trusted between the read and the write of the manifest', async () => {
+  describe('migration steps', () => {
+    it('copies every v1 key into keys/ before the version is switched, and fences last', async () => {
       const { root } = v1Store();
-      let injected = false;
-      await initStore(root, FIXTURE_NOW, {
-        onStep: (name) => {
-          if (name === 'migrate:keys-copied' && !injected) {
-            injected = true;
-            addV1Key(root, 'late-v1-key');
-          }
-        },
-      });
-      expect(injected).toBe(true);
-      expect(readManifest(root).version).toBe(2);
-      expect(readManifest(root).trustedKeys.map((k) => k.keyId).sort()).toEqual(['late-v1-key', KEY_ID]);
-      expect(readKeyDirectory(root).keys.map((k) => k.keyId).sort()).toEqual(['late-v1-key', KEY_ID]);
-    });
-
-    it('copies every v1 key into keys/ before the version is switched', async () => {
-      const { root } = v1Store();
-      let seen: { version: number; keys: string[] } | undefined;
+      let seen: { version: number; keys: string[]; fenced: boolean } | undefined;
       await initStore(root, FIXTURE_NOW, {
         onStep: (name) => {
           if (name === 'migrate:keys-copied') {
             seen = {
               version: JSON.parse(readFileSync(join(root, 'manifest.json'), 'utf8')).version,
               keys: readKeyDirectory(root).keys.map((k) => k.keyId),
+              fenced: existsSync(join(root, 'bundles', '.format-v2')),
             };
           }
         },
       });
-      expect(seen).toEqual({ version: 1, keys: [KEY_ID] });
+      expect(seen).toEqual({ version: 1, keys: [KEY_ID], fenced: false });
     });
 
-    it('gives up with a clear error if the manifest never stops changing', async () => {
-      const { root } = v1Store();
-      let n = 0;
-      await expect(
-        initStore(root, FIXTURE_NOW, {
-          onStep: (name) => {
-            if (name === 'migrate:keys-copied') addV1Key(root, `churn-${n++}`);
-          },
-        })
-      ).rejects.toThrow(/kept changing/);
-      expect(readManifest(root).version).toBe(1);
+    it('two new migrators at once leave one consistent version 2 store', async () => {
+      const { root, digest } = v1Store();
+      let inner: Promise<unknown> | undefined;
+      await initStore(root, FIXTURE_NOW, {
+        onStep: (name) => {
+          // initStore runs synchronously, so this second migrator completes
+          // entirely inside the first one's window between copy and rewrite.
+          if (name === 'migrate:keys-copied' && inner === undefined) inner = initStore(root, FIXTURE_NOW);
+        },
+      });
+      await inner;
+      expect(inner).toBeDefined();
+      expect(readManifest(root).version).toBe(2);
+      expect(readManifest(root).trustedKeys.map((k) => k.keyId)).toEqual([KEY_ID]);
+      expect(readdirSync(join(root, 'keys')).filter((name) => !name.startsWith('.'))).toHaveLength(1);
+      expect(statSync(join(root, 'bundles', '.format-v2')).isFile()).toBe(true);
+      expect(listEntries(root).map((e) => e.bundleDigest)).toEqual([digest]);
+      expect((await verifyStore(root, { now: FIXTURE_NOW, baseDir: BASE })).ok).toBe(true);
     });
   });
 
-  describe('with an old CLI holding the pid lock', () => {
-    const deadPid = (): number => {
-      const child = spawnSync(process.execPath, ['-e', '']);
-      return child.pid;
-    };
+  describe('with a .lock file left by an older CLI', () => {
     const untouched = (root: string) => {
       expect(readManifest(root).version).toBe(1);
+      expect(existsSync(join(root, 'keys')) ? readdirSync(join(root, 'keys')) : []).toEqual([]);
       expect(existsSync(join(root, 'bundles', '.format-v2'))).toBe(false);
     };
-
-    it('refuses to migrate while the lock holder is alive, naming the process and the lock file', async () => {
-      const { root } = v1Store();
-      writeFileSync(join(root, '.lock'), `${process.pid}\n`);
-      await expect(initStore(root, FIXTURE_NOW)).rejects.toThrow(
-        new RegExp(`an older terminal221b \\(pid ${process.pid}\\) is writing this store; let it finish or remove .*\\.lock`)
+    const refusal = (root: string) =>
+      new RegExp(
+        `this store was last used by an older terminal221b and still has its lock file ${join(root, '.lock').replace(/[.\\]/g, '\\$&')}; ` +
+          'make sure no older terminal221b is running, delete the file, and retry'
       );
+
+    it.each([
+      ['a live pid', `${process.pid}\n`],
+      ['a dead pid', '2147483646\n'],
+      ['junk', 'not-a-pid\n'],
+      ['nothing', ''],
+    ])('refuses to migrate when the lock holds %s, and changes nothing', async (_label, content) => {
+      const { root } = v1Store();
+      writeFileSync(join(root, '.lock'), content);
+      await expect(initStore(root, FIXTURE_NOW)).rejects.toThrow(refusal(root));
       untouched(root);
-      await expect(put(root, signedX)).rejects.toThrow(/older terminal221b/);
-      expect(() => trustKey(root, { keyId: 'k2', publicKey: OTHER.publicKey }, FIXTURE_NOW)).toThrow(/older terminal221b/);
+      await expect(put(root, signedX)).rejects.toThrow(refusal(root));
+      expect(() => trustKey(root, { keyId: 'k2', publicKey: OTHER.publicKey }, FIXTURE_NOW)).toThrow(refusal(root));
       expect(revisionFiles(root)).toEqual(['1.json']);
       untouched(root);
     });
 
-    it('migrates when the lock names a dead process, or is not a pid', async () => {
-      const dead = v1Store().root;
-      writeFileSync(join(dead, '.lock'), `${deadPid()}\n`);
-      await initStore(dead, FIXTURE_NOW);
-      expect(readManifest(dead).version).toBe(2);
+    it('migrates once the lock file is deleted', async () => {
+      const { root } = v1Store();
+      writeFileSync(join(root, '.lock'), `${process.pid}\n`);
+      await expect(initStore(root, FIXTURE_NOW)).rejects.toThrow(/lock file/);
+      rmSync(join(root, '.lock'));
+      await initStore(root, FIXTURE_NOW);
+      expect(readManifest(root).version).toBe(2);
+    });
 
-      const junk = v1Store().root;
-      writeFileSync(join(junk, '.lock'), 'not-a-pid\n');
-      await initStore(junk, FIXTURE_NOW);
-      expect(readManifest(junk).version).toBe(2);
+    it('migrates a store with no lock file at all', async () => {
+      const { root } = v1Store();
+      expect(existsSync(join(root, '.lock'))).toBe(false);
+      await initStore(root, FIXTURE_NOW);
+      expect(readManifest(root).version).toBe(2);
+      expect(statSync(join(root, 'bundles', '.format-v2')).isFile()).toBe(true);
     });
 
     it('ignores a leftover lock once the store is version 2', async () => {
@@ -832,17 +823,8 @@ describe('a version 1 store', () => {
       writeFileSync(join(root, '.lock'), `${process.pid}\n`);
       expect((await put(root, signedX)).revision).toBe(2);
     });
-
-    it('treats a live process we may not signal (EPERM) as alive', async () => {
-      if (process.getuid?.() === 0) return; // root can signal pid 1
-      const { root } = v1Store();
-      writeFileSync(join(root, '.lock'), '1\n');
-      await expect(initStore(root, FIXTURE_NOW)).rejects.toThrow(/older terminal221b \(pid 1\)/);
-    });
   });
 });
-
-
 
 describe('no lock-free write reaches an unfenced store', () => {
   it('fences a fresh store at init', async () => {

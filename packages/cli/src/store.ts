@@ -197,7 +197,7 @@ export interface StorePaths {
   transitions: string;
   /** One log file per writer process; see recordTransition. */
   transitionsDir: string;
-  /** The pid lock version 1 CLIs took around every write. Never created by this version; only consulted before a migration. */
+  /** The pid lock version 1 CLIs took around every write. Never created by this version; only its existence is checked before a migration. */
   legacyLock: string;
 }
 
@@ -255,7 +255,7 @@ export async function initStore(root: string, now: string, context?: StoreContex
   for (const dir of [paths.bundles, paths.objects, paths.keys, paths.transitionsDir]) {
     mkdirSync(dir, { recursive: true });
   }
-  // A version 1 store is migrated (which checks for a live old writer before it
+  // A version 1 store is migrated (which refuses on a leftover .lock before it
   // fences anything), so the fence must not be laid down ahead of that check.
   const isV1 = existsSync(paths.manifest) && frozenKeysOfV1(paths) !== undefined;
   if (isV1) {
@@ -278,11 +278,10 @@ export async function initStore(root: string, now: string, context?: StoreContex
 }
 
 /**
- * Every writer calls this first. A version 1 store may still be written by an
- * old CLI that trusts its pid lock, and a lock-free writer landing there would
- * have its claimed revision replaced by that CLI's rename. Upgrading (which
- * fences old binaries out) before the first write closes that gap, so no
- * lock-free write path can reach a store that is not fenced.
+ * Every writer calls this first, so no lock-free write path reaches a version 1
+ * store: it is migrated (and so fenced against old binaries) before the first
+ * write, or, if a leftover .lock shows an older CLI used it last, the write is
+ * refused with nothing changed.
  */
 function upgradeIfV1(paths: StorePaths, now: string, runtime: StoreRuntime): void {
   if (existsSync(paths.manifest) && frozenKeysOfV1(paths) !== undefined) migrateStore(paths, now, runtime);
@@ -416,63 +415,57 @@ export function trustKey(
 }
 
 /**
- * Brings a version 1 store up to version 2. Idempotent, and safe to run from
- * several processes: every step is either an exclusive create or a rewrite of
- * identical bytes. It refuses while an old CLI holds its pid lock, copies each
- * v1 key into keys/ first, and writes the v2 manifest only if the v1 bytes are
- * still the ones those keys came from (see the loop below).
+ * Brings a version 1 store up to version 2. Only a store whose `.lock` file does
+ * not exist at all (whatever it contains) is migrated: a lock file means an
+ * older terminal221b used the store last, and upgrading underneath one that may
+ * still be running is not supported. In that case this refuses and changes
+ * nothing; the operator confirms no old CLI is running, deletes the file, and
+ * retries.
+ *
+ * Idempotent, and safe to run from several new migrators at once: the order is
+ * lock check, then each v1 key copied into keys/ (an exclusive create), then the
+ * v2 manifest (a rewrite with identical bytes, since every migrator read the
+ * same v1 list), and last bundles/.format-v2. The fence goes last so a refusal
+ * or a crash never leaves a store fenced but not migrated; initStore lays it
+ * down again if only that step was lost.
  *
  * bundles/.format-v2 is a regular file where an old CLI expects only entry
  * directories. Its listEntries readdir()s it as if it were one and fails with
- * ENOTDIR, so an old binary cannot keep writing a store whose lock it no longer
- * honours. (The version number fences it as well: an old readManifest rejects 2.)
- * Entry names cannot collide with it, because they must start alphanumeric.
+ * ENOTDIR, so an old binary cannot keep writing a migrated store. (The version
+ * number fences it as well: an old readManifest rejects 2.) Entry names cannot
+ * collide with it, because they must start alphanumeric.
  */
-function migrateStore(
-  paths: StorePaths,
-  now: string,
-  runtime: StoreRuntime
-): void {
-  for (let attempt = 1; attempt <= MAX_MIGRATE_ATTEMPTS; attempt += 1) {
-    assertNoLiveV1Writer(paths, runtime);
-    const before = readManifestBytes(paths);
-    const keys = before === undefined ? undefined : v1KeysIn(before);
-    if (before === undefined || keys === undefined) return; // someone else finished the migration
-    mkdirSync(paths.keys, { recursive: true });
-    mkdirSync(paths.transitionsDir, { recursive: true });
-    // Every v1 key gets its own exclusive file before the version flips, so no
-    // key exists only in a list that is about to be frozen.
-    for (const key of keys.filter(isTrustedKey)) {
-      createExclusive(
-        runtime,
-        join(paths.keys, keyFileName(key.keyId)),
-        Buffer.from(`${JSON.stringify(key, null, 2)}\n`, 'utf8')
-      );
-    }
-    createExclusive(runtime, join(paths.bundles, FORMAT_FENCE), FENCE_BYTES);
-    runtime.step('migrate:keys-copied');
-    assertNoLiveV1Writer(paths, runtime);
-    // An old CLI may have trusted a key since we read the manifest. Writing v2
-    // from the stale list would drop it, so write only if the bytes are the ones
-    // the key files were copied from, and start over if they are not. The
-    // remaining window is the gap between this read and the rename below.
-    const after = readManifestBytes(paths);
-    if (after === undefined || sha256(after) !== sha256(before)) continue;
-    writeDurableWith(
-      runtime,
-      paths.manifest,
-      `${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: keys }, null, 2)}\n`
+function migrateStore(paths: StorePaths, now: string, runtime: StoreRuntime): void {
+  const keys = v1KeysOf(paths);
+  if (keys === undefined) return; // someone else finished the migration
+  if (runtime.io.readdir(paths.root).includes(LEGACY_LOCK_NAME)) {
+    throw new Error(
+      `this store was last used by an older terminal221b and still has its lock file ${paths.legacyLock}; ` +
+        'make sure no older terminal221b is running, delete the file, and retry'
     );
-    recordTransition(runtime, paths, { at: now, action: 'migrate', detail: 'store layout upgraded from version 1 to 2' });
-    return;
   }
-  throw new Error(
-    `the store manifest kept changing for ${MAX_MIGRATE_ATTEMPTS} attempts while upgrading it; ` +
-      'an older terminal221b is probably still writing, so retry once it has finished'
-  );
+  mkdirSync(paths.keys, { recursive: true });
+  mkdirSync(paths.transitionsDir, { recursive: true });
+  for (const key of keys.filter(isTrustedKey)) {
+    createExclusive(
+      runtime,
+      join(paths.keys, keyFileName(key.keyId)),
+      Buffer.from(`${JSON.stringify(key, null, 2)}\n`, 'utf8')
+    );
+  }
+  runtime.step('migrate:keys-copied');
+  writeDurableWith(runtime, paths.manifest, `${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: keys }, null, 2)}\n`);
+  createExclusive(runtime, join(paths.bundles, FORMAT_FENCE), FENCE_BYTES);
+  recordTransition(runtime, paths, { at: now, action: 'migrate', detail: 'store layout upgraded from version 1 to 2' });
 }
 
-const MAX_MIGRATE_ATTEMPTS = 5;
+const LEGACY_LOCK_NAME = '.lock';
+
+/** The key list of the manifest on disk if it is still version 1, otherwise undefined. */
+function v1KeysOf(paths: StorePaths): TrustedKey[] | undefined {
+  const bytes = readManifestBytes(paths);
+  return bytes === undefined ? undefined : v1KeysIn(bytes);
+}
 
 function readManifestBytes(paths: StorePaths): Buffer | undefined {
   try {
@@ -492,38 +485,6 @@ function v1KeysIn(bytes: Buffer): TrustedKey[] | undefined {
     // Not parseable: not a manifest we can migrate from.
   }
   return undefined;
-}
-
-/**
- * A version 1 CLI serialises its writes with a pid lock and trusts it. Migrating
- * underneath one that is mid-write would let it rename over a revision a
- * lock-free writer has just claimed, so a live holder blocks the migration. A
- * missing lock, one that is not a bare pid, or one whose process is gone is what
- * the old CLI itself treats as free. EPERM means the process exists but belongs
- * to someone else, which is alive. This narrows the window rather than closing
- * it: an old CLI can still take the lock a moment after this check.
- */
-function assertNoLiveV1Writer(paths: StorePaths, runtime: StoreRuntime): void {
-  let holder: string;
-  try {
-    holder = runtime.io.readFile(paths.legacyLock).toString('utf8').trim();
-  } catch (error) {
-    if (errnoCode(error) === 'ENOENT') return;
-    throw error;
-  }
-  if (!/^\d+$/.test(holder) || !isProcessAlive(Number(holder))) return;
-  throw new Error(
-    `an older terminal221b (pid ${holder}) is writing this store; let it finish or remove ${paths.legacyLock}`
-  );
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return errnoCode(error) === 'EPERM';
-  }
 }
 
 /** Skipped by every directory listing of bundles/; see migrateStore. */
