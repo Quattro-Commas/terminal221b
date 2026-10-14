@@ -1077,7 +1077,7 @@ export async function getBundle(
   return { entry, revision: target, bundle, report };
 }
 
-export function listEntries(root: string): StoreEntry[] {
+export function listEntries(root: string, runtime: StoreRuntime = resolveContext()): StoreEntry[] {
   const paths = storePaths(root);
   if (!existsSync(paths.bundles)) return [];
   const transitions = readTransitions(root);
@@ -1086,7 +1086,7 @@ export function listEntries(root: string): StoreEntry[] {
     if (name.startsWith('.')) continue;
     const dir = join(paths.bundles, name);
     if (!existsSync(dir)) continue;
-    for (const revision of listRevisions(resolveContext(), paths, name)) {
+    for (const revision of listRevisions(runtime, paths, name)) {
       const recorded = transitions.find(
         (line) => line.entry === name && line.revision === revision && line.bundleDigest
       );
@@ -1358,52 +1358,74 @@ export function purgeExpired(
     );
   }
 
+  const digestOf = new Map(
+    listEntries(root, runtime).map((stored) => [`${stored.entry}@${stored.revision}`, stored.bundleDigest])
+  );
   const removed: PurgeResult['removed'] = [];
-  return withStoreLock(paths, () => {
-    for (const item of report.purgeable) {
-      const at = item.lastIndexOf('@');
-      const entry = item.slice(0, at);
-      const revision = Number(item.slice(at + 1));
-      const sources = report.rows
-        .filter((row) => row.entry === entry && row.revision === revision && row.status === 'past-window')
-        .map((row) => row.sourceId);
-      rmSync(bundlePathFor(paths, entry, revision), { force: true });
-      recordTransition(runtime, paths, {
-        at: now,
-        action: 'purge',
-        entry,
-        revision,
-        detail: `removed past its retention window: ${sources.join(', ')}`,
-      });
-      removed.push({ entry, revision, sources });
+  const purgedDigests = new Set<string>();
+  for (const item of report.purgeable) {
+    const at = item.lastIndexOf('@');
+    const entry = item.slice(0, at);
+    const revision = Number(item.slice(at + 1));
+    const sources = report.rows
+      .filter((row) => row.entry === entry && row.revision === revision && row.status === 'past-window')
+      .map((row) => row.sourceId);
+    // The record goes first. A crash between the two leaves a revision that is
+    // still there and still verifies, and a repeat purge writes the identical
+    // line again, which readers collapse. The other order could delete evidence
+    // with no trace of why.
+    recordTransition(runtime, paths, {
+      at: now,
+      action: 'purge',
+      entry,
+      revision,
+      detail: `removed past its retention window: ${sources.join(', ')}`,
+    });
+    runtime.step('purge:recorded');
+    try {
+      runtime.io.unlink(bundlePathFor(paths, entry, revision));
+    } catch (error) {
+      if (errnoCode(error) !== 'ENOENT') throw error;
     }
+    const digest = digestOf.get(item);
+    if (digest !== undefined) purgedDigests.add(digest);
+    removed.push({ entry, revision, sources });
+  }
+  runtime.step('purge:revisions-removed');
+  for (const digest of purgedDigests) collectObject(runtime, paths, digest);
+  return { removed, token: report.token };
+}
 
-    // The object store is content-addressed, so two revisions of the same bundle
-    // share one object file. Deleting the object of a purged revision would
-    // therefore delete the bytes a *surviving* revision still points at, and the
-    // store would fail its own integrity check on a store nothing tampered
-    // with. An object is only orphaned once no surviving revision names it.
-    const stillReferenced = new Set(
-      listEntries(paths.root)
-        .map((stored) => stored.bundleDigest)
-        .filter((digest): digest is string => digest !== undefined)
-    );
-    const purgedDigests = new Set(
-      removed
-        .map(({ entry, revision }) =>
-          readTransitions(root).find(
-            (line) => line.entry === entry && line.revision === revision && line.bundleDigest
-          )?.bundleDigest
-        )
-        .filter((digest): digest is string => digest !== undefined)
-    );
-    for (const digest of purgedDigests) {
-      if (!stillReferenced.has(digest)) {
-        rmSync(join(paths.objects, digest.replace(':', '-')), { force: true });
-      }
-    }
-    return { removed, token: report.token };
-  });
+/**
+ * Deletes the object for `digest` unless a surviving revision still names it.
+ *
+ * The object store is content-addressed, so revisions of identical bytes share
+ * one object, and deleting a purged revision's object would delete the bytes a
+ * surviving revision points at. With no lock to serialise against a concurrent
+ * `put`, the object is first renamed out of the way (condemned), and only then
+ * is the question asked: re-list the revisions, then re-read the transitions,
+ * and if any revision that exists is vouched by this digest, rename it back.
+ * `put` closes the other half: it appends its transition and only then checks
+ * the object, rewriting it if it was condemned in between. So whichever side
+ * moves second sees the other, and an object in use is not lost on a local
+ * filesystem. Over NFS the re-check can read stale directory attributes, so
+ * this guarantee is weaker there; `verify` reports a missing object either way.
+ *
+ * A crash leaves `.condemned-*` behind, which readers ignore and `verify` reports.
+ */
+function collectObject(runtime: StoreRuntime, paths: StorePaths, digest: string): void {
+  const object = objectPathFor(paths, digest);
+  const condemned = join(paths.objects, `.condemned-${digest.replace(':', '-')}-${runtime.randomHex(8)}`);
+  try {
+    runtime.io.rename(object, condemned);
+  } catch (error) {
+    if (errnoCode(error) === 'ENOENT') return;
+    throw error;
+  }
+  runtime.step('purge:condemned');
+  const inUse = listEntries(paths.root, runtime).some((stored) => stored.bundleDigest === digest);
+  if (inUse) runtime.io.rename(condemned, object);
+  else runtime.io.unlink(condemned);
 }
 
 /**
