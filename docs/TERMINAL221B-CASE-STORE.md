@@ -39,7 +39,9 @@ Three properties it has, and one it does not.
   objects/<sha256-hex>      content-addressed copy of each stored bundle
 ```
 
-There is no lock. Writers claim names with an exclusive create and retry on a collision; see `docs/adr/0001-lock-free-case-store.md`. Temp files (`.*.tmp-*`) and condemned objects (`objects/.condemned-*`) are ignored by readers and listed by `verify` if an interrupted write left them.
+There is no lock. Writers claim names with an exclusive create and retry on a collision; see `docs/adr/0001-lock-free-case-store.md`. Temp files (`.<name>.tmp-<hex>`) and condemned objects (`objects/.condemned-*`) are ignored by readers and listed by `verify` if an interrupted write left them; an entry whose name merely contains `.tmp-` is not one.
+
+Upgrading a version 1 store (done by `init`, or by the first `put`, `trust` or `retention --purge` that meets one) is refused while an older `terminal221b` holds `<store>/.lock` with a live pid, and says so; let it finish or remove the lock. Migration copies every v1 key into `keys/` and retries if the manifest changes underneath it. Version 1 binaries are then locked out of `put`, `trust`, `verify`, `get`, `list` and the retention report and purge. They are **not** locked out of `retention --record-default-policy` (it can still replace `retention.json`) or of `init`, and an old command that was already running when the store was upgraded is not stopped; see the ADR for exactly what that can and cannot touch.
 
 The store root comes from `--store`, else `$XDG_DATA_HOME/terminal221b`, else `~/.local/share/terminal221b`. It is deliberately **outside any repository**: `case store init` says so on every run, because a store inside a git tree is a store whose attestations and operator key ids end up in a commit.
 
@@ -101,7 +103,7 @@ Four consequences, each with a test:
 
 Then, with no lock: the bundle is serialised, a copy written to `objects/<sha256>`, the next revision claimed exclusively as `bundles/<entry>/<n>.json` (a collision re-lists and takes the next number), its digest recorded in this process's `transitions.d/` log, and the object re-checked. A read without `--revision` returns the newest revision a transition vouches for.
 
-`getBundle` re-runs all of it on the way out. `verifyStore` re-runs it across every revision in the store and additionally compares each file's bytes against the digest recorded at write time — never against a digest recomputed from those same bytes, which is F19 and the reason a green suite did not catch it.
+`getBundle` re-runs all of it on the way out, including for an explicit `--revision`: a revision no put transition vouches for, or whose bytes no longer hash to the digest the put recorded, is refused (or listed as a problem with `--no-verify`). `verifyStore` re-runs it across every revision in the store and additionally compares each file's bytes against the digest recorded at write time — never against a digest recomputed from those same bytes, which is F19 and the reason a green suite did not catch it.
 
 ## 5. Source verification reach
 
