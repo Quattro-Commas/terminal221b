@@ -257,9 +257,9 @@ export async function initStore(root: string, now: string, context?: StoreContex
   }
   // A version 1 store is migrated (which checks for a live old writer before it
   // fences anything), so the fence must not be laid down ahead of that check.
-  const existing = existsSync(paths.manifest) ? frozenKeysOfV1(paths) : undefined;
-  if (existing !== undefined) {
-    migrateStore(paths, existing, now, runtime);
+  const isV1 = existsSync(paths.manifest) && frozenKeysOfV1(paths) !== undefined;
+  if (isV1) {
+    migrateStore(paths, now, runtime);
     return paths;
   }
   createExclusive(runtime, join(paths.bundles, FORMAT_FENCE), FENCE_BYTES);
@@ -273,8 +273,7 @@ export async function initStore(root: string, now: string, context?: StoreContex
     recordTransition(runtime, paths, { at: now, action: 'init', detail: `store initialised at ${paths.root}` });
     return paths;
   }
-  const frozen = frozenKeysOfV1(paths);
-  if (frozen !== undefined) migrateStore(paths, frozen, now, runtime);
+  if (frozenKeysOfV1(paths) !== undefined) migrateStore(paths, now, runtime);
   return paths;
 }
 
@@ -286,8 +285,7 @@ export async function initStore(root: string, now: string, context?: StoreContex
  * lock-free write path can reach a store that is not fenced.
  */
 function upgradeIfV1(paths: StorePaths, now: string, runtime: StoreRuntime): void {
-  const frozen = existsSync(paths.manifest) ? frozenKeysOfV1(paths) : undefined;
-  if (frozen !== undefined) migrateStore(paths, frozen, now, runtime);
+  if (existsSync(paths.manifest) && frozenKeysOfV1(paths) !== undefined) migrateStore(paths, now, runtime);
 }
 
 /** The base key list if the manifest is still version 1, otherwise undefined (including while it is mid-write). */
@@ -420,7 +418,9 @@ export function trustKey(
 /**
  * Brings a version 1 store up to version 2. Idempotent, and safe to run from
  * several processes: every step is either an exclusive create or a rewrite of
- * identical bytes.
+ * identical bytes. It refuses while an old CLI holds its pid lock, copies each
+ * v1 key into keys/ first, and writes the v2 manifest only if the v1 bytes are
+ * still the ones those keys came from (see the loop below).
  *
  * bundles/.format-v2 is a regular file where an old CLI expects only entry
  * directories. Its listEntries readdir()s it as if it were one and fails with
@@ -430,21 +430,68 @@ export function trustKey(
  */
 function migrateStore(
   paths: StorePaths,
-  frozenKeys: TrustedKey[],
   now: string,
   runtime: StoreRuntime
 ): void {
-  assertNoLiveV1Writer(paths, runtime);
-  mkdirSync(paths.keys, { recursive: true });
-  mkdirSync(paths.transitionsDir, { recursive: true });
-  createExclusive(runtime, join(paths.bundles, FORMAT_FENCE), FENCE_BYTES);
-  runtime.step('migrate:fenced');
-  writeDurableWith(
-    runtime,
-    paths.manifest,
-    `${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: frozenKeys }, null, 2)}\n`
+  for (let attempt = 1; attempt <= MAX_MIGRATE_ATTEMPTS; attempt += 1) {
+    assertNoLiveV1Writer(paths, runtime);
+    const before = readManifestBytes(paths);
+    const keys = before === undefined ? undefined : v1KeysIn(before);
+    if (before === undefined || keys === undefined) return; // someone else finished the migration
+    mkdirSync(paths.keys, { recursive: true });
+    mkdirSync(paths.transitionsDir, { recursive: true });
+    // Every v1 key gets its own exclusive file before the version flips, so no
+    // key exists only in a list that is about to be frozen.
+    for (const key of keys.filter(isTrustedKey)) {
+      createExclusive(
+        runtime,
+        join(paths.keys, keyFileName(key.keyId)),
+        Buffer.from(`${JSON.stringify(key, null, 2)}\n`, 'utf8')
+      );
+    }
+    createExclusive(runtime, join(paths.bundles, FORMAT_FENCE), FENCE_BYTES);
+    runtime.step('migrate:keys-copied');
+    assertNoLiveV1Writer(paths, runtime);
+    // An old CLI may have trusted a key since we read the manifest. Writing v2
+    // from the stale list would drop it, so write only if the bytes are the ones
+    // the key files were copied from, and start over if they are not. The
+    // remaining window is the gap between this read and the rename below.
+    const after = readManifestBytes(paths);
+    if (after === undefined || sha256(after) !== sha256(before)) continue;
+    writeDurableWith(
+      runtime,
+      paths.manifest,
+      `${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: keys }, null, 2)}\n`
+    );
+    recordTransition(runtime, paths, { at: now, action: 'migrate', detail: 'store layout upgraded from version 1 to 2' });
+    return;
+  }
+  throw new Error(
+    `the store manifest kept changing for ${MAX_MIGRATE_ATTEMPTS} attempts while upgrading it; ` +
+      'an older terminal221b is probably still writing, so retry once it has finished'
   );
-  recordTransition(runtime, paths, { at: now, action: 'migrate', detail: 'store layout upgraded from version 1 to 2' });
+}
+
+const MAX_MIGRATE_ATTEMPTS = 5;
+
+function readManifestBytes(paths: StorePaths): Buffer | undefined {
+  try {
+    return readFileSync(paths.manifest);
+  } catch (error) {
+    if (errnoCode(error) === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+/** The key list of a version 1 manifest, or undefined if these bytes are not one (including mid-write). */
+function v1KeysIn(bytes: Buffer): TrustedKey[] | undefined {
+  try {
+    const value = JSON.parse(bytes.toString('utf8')) as { version?: unknown; trustedKeys?: unknown } | null;
+    if (value?.version === 1 && Array.isArray(value.trustedKeys)) return value.trustedKeys as TrustedKey[];
+  } catch {
+    // Not parseable: not a manifest we can migrate from.
+  }
+  return undefined;
 }
 
 /**

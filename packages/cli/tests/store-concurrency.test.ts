@@ -678,8 +678,67 @@ describe('a version 1 store', () => {
 
     trustKey(root, { keyId: 'later', publicKey: OTHER.publicKey }, FIXTURE_NOW);
     expect(readManifest(root).trustedKeys.map((k) => k.keyId).sort()).toEqual(['later', KEY_ID]);
-    expect(readKeyDirectory(root).keys).toHaveLength(1);
+    // The v1 key was copied into keys/ during migration, alongside the one trusted since.
+    expect(readKeyDirectory(root).keys.map((k) => k.keyId).sort()).toEqual(['later', KEY_ID]);
     expect((await put(root, signedX)).revision).toBe(2);
+  });
+
+  describe('while an old CLI is still adding trusted keys', () => {
+    const spki = (key: typeof publicKey) => key.export({ type: 'spki', format: 'der' }).toString('base64');
+    const addV1Key = (root: string, keyId: string) => {
+      const manifest = JSON.parse(readFileSync(join(root, 'manifest.json'), 'utf8')) as {
+        version: number;
+        trustedKeys: unknown[];
+      };
+      manifest.trustedKeys.push({ keyId, publicKeySpkiDerBase64: spki(OTHER.publicKey), addedAt: FIXTURE_NOW });
+      writeFileSync(join(root, 'manifest.json'), JSON.stringify(manifest));
+    };
+
+    it('keeps a key an old CLI trusted between the read and the write of the manifest', async () => {
+      const { root } = v1Store();
+      let injected = false;
+      await initStore(root, FIXTURE_NOW, {
+        onStep: (name) => {
+          if (name === 'migrate:keys-copied' && !injected) {
+            injected = true;
+            addV1Key(root, 'late-v1-key');
+          }
+        },
+      });
+      expect(injected).toBe(true);
+      expect(readManifest(root).version).toBe(2);
+      expect(readManifest(root).trustedKeys.map((k) => k.keyId).sort()).toEqual(['late-v1-key', KEY_ID]);
+      expect(readKeyDirectory(root).keys.map((k) => k.keyId).sort()).toEqual(['late-v1-key', KEY_ID]);
+    });
+
+    it('copies every v1 key into keys/ before the version is switched', async () => {
+      const { root } = v1Store();
+      let seen: { version: number; keys: string[] } | undefined;
+      await initStore(root, FIXTURE_NOW, {
+        onStep: (name) => {
+          if (name === 'migrate:keys-copied') {
+            seen = {
+              version: JSON.parse(readFileSync(join(root, 'manifest.json'), 'utf8')).version,
+              keys: readKeyDirectory(root).keys.map((k) => k.keyId),
+            };
+          }
+        },
+      });
+      expect(seen).toEqual({ version: 1, keys: [KEY_ID] });
+    });
+
+    it('gives up with a clear error if the manifest never stops changing', async () => {
+      const { root } = v1Store();
+      let n = 0;
+      await expect(
+        initStore(root, FIXTURE_NOW, {
+          onStep: (name) => {
+            if (name === 'migrate:keys-copied') addV1Key(root, `churn-${n++}`);
+          },
+        })
+      ).rejects.toThrow(/kept changing/);
+      expect(readManifest(root).version).toBe(1);
+    });
   });
 
   describe('with an old CLI holding the pid lock', () => {
