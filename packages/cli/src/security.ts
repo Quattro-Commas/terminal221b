@@ -141,7 +141,7 @@ export async function scanLocalWorkspace(workspacePath: string): Promise<LocalSc
       }
       if (!entry.isFile() || !shouldScanFile(entry.name)) continue;
 
-      const read = await readBoundedFile(absolutePath, Math.min(maxFileBytes, maxTotalBytes - bytesScanned));
+      const read = await readBoundedFile(absolutePath, Math.min(maxFileBytes, maxTotalBytes - bytesScanned), root);
       if (read.kind === 'skipped') {
         if (read.reason === 'too-large') truncated = true;
         continue;
@@ -151,7 +151,7 @@ export async function scanLocalWorkspace(workspacePath: string): Promise<LocalSc
 
       const path = relative(root, absolutePath).split(sep).join('/');
       filesScanned += 1;
-      bytesScanned += Buffer.byteLength(content, 'utf8');
+      bytesScanned += read.bytes; // bytes on disk, not the decoded length
       sourceFiles.push(path);
 
       for (const [index, line] of content.split(/\r?\n/).entries()) {

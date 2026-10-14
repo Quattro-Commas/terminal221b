@@ -106,14 +106,14 @@ export async function collectWorkspaceContext(
       if (!entry.isFile() || isIgnoredFile(entry.name)) continue;
       if (!textExtensions.has(extname(entry.name).toLowerCase())) continue;
 
-      const read = await readBoundedFile(absolutePath, Math.min(maxFileBytes, maxTotalBytes - totalBytes));
+      const read = await readBoundedFile(absolutePath, Math.min(maxFileBytes, maxTotalBytes - totalBytes), root);
       if (read.kind === 'skipped') continue;
       const content = read.content;
       if (content.includes('\0')) continue;
 
       const path = relative(root, absolutePath).split(sep).join('/');
       files.push({ path, content });
-      totalBytes += Buffer.byteLength(content, 'utf8');
+      totalBytes += read.bytes; // bytes on disk, not the decoded length
     }
   }
 
