@@ -833,6 +833,49 @@ describe('no lock-free write reaches an unfenced store', () => {
     expect(statSync(join(root, 'bundles', '.format-v2')).isFile()).toBe(true);
   });
 
+  it('does not fence a store whose v1 manifest appears during init when a .lock refuses the migration', async () => {
+    const root = scratch('fence-init-race');
+    const spki = publicKey.export({ type: 'spki', format: 'der' }).toString('base64');
+    await expect(
+      initStore(root, FIXTURE_NOW, {
+        onStep: (name) => {
+          if (name === 'init:before-manifest') {
+            writeFileSync(
+              join(root, 'manifest.json'),
+              JSON.stringify({ version: 1, trustedKeys: [{ keyId: KEY_ID, publicKeySpkiDerBase64: spki, addedAt: FIXTURE_NOW }] })
+            );
+            writeFileSync(join(root, '.lock'), '');
+          }
+        },
+      })
+    ).rejects.toThrow(/lock file/);
+    expect(readManifest(root).version).toBe(1);
+    expect(existsSync(join(root, 'bundles', '.format-v2'))).toBe(false);
+  });
+
+  it.each(['init', 'put', 'trust'])('restores a fence lost after the manifest was written, on %s', async (how) => {
+    const root = scratch(`fence-lost-${how}`);
+    const noFence = {
+      io: {
+        link: (from: string, to: string) => {
+          if (to.endsWith('.format-v2')) throw errno('EIO');
+          linkSync(from, to);
+        },
+      },
+    };
+    await expect(initStore(root, FIXTURE_NOW, noFence)).rejects.toThrow(/EIO/);
+    expect(readManifest(root).version).toBe(2);
+    expect(existsSync(join(root, 'bundles', '.format-v2'))).toBe(false);
+    if (how === 'init') await initStore(root, FIXTURE_NOW);
+    else if (how === 'trust') trustKey(root, { keyId: KEY_ID, publicKey }, FIXTURE_NOW);
+    else {
+      trustKey(root, { keyId: KEY_ID, publicKey }, FIXTURE_NOW);
+      rmSync(join(root, 'bundles', '.format-v2'), { force: true });
+      await put(root, signedX);
+    }
+    expect(statSync(join(root, 'bundles', '.format-v2')).isFile()).toBe(true);
+  });
+
   it('migrates a version 1 store before put writes anything', async () => {
     const root = scratch('fence-put');
     mkdirSync(join(root, 'bundles'), { recursive: true });

@@ -255,26 +255,31 @@ export async function initStore(root: string, now: string, context?: StoreContex
   for (const dir of [paths.bundles, paths.objects, paths.keys, paths.transitionsDir]) {
     mkdirSync(dir, { recursive: true });
   }
-  // A version 1 store is migrated (which refuses on a leftover .lock before it
-  // fences anything), so the fence must not be laid down ahead of that check.
-  const isV1 = existsSync(paths.manifest) && frozenKeysOfV1(paths) !== undefined;
-  if (isV1) {
-    migrateStore(paths, now, runtime);
-    return paths;
-  }
-  createExclusive(runtime, join(paths.bundles, FORMAT_FENCE), FENCE_BYTES);
   runtime.step('init:before-manifest');
+  // Manifest first, fence second, the same order as a migration: a v1 manifest
+  // that turns up here is migrated (or refused on its .lock) without a fence
+  // having been laid ahead of that decision.
   const fresh = createExclusive(
     runtime,
     paths.manifest,
     Buffer.from(`${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: [] }, null, 2)}\n`, 'utf8')
   );
-  if (fresh) {
-    recordTransition(runtime, paths, { at: now, action: 'init', detail: `store initialised at ${paths.root}` });
+  if (!fresh && frozenKeysOfV1(paths) !== undefined) {
+    migrateStore(paths, now, runtime);
     return paths;
   }
-  if (frozenKeysOfV1(paths) !== undefined) migrateStore(paths, now, runtime);
+  ensureFence(paths, runtime);
+  if (fresh) recordTransition(runtime, paths, { at: now, action: 'init', detail: `store initialised at ${paths.root}` });
   return paths;
+}
+
+/** Lays down bundles/.format-v2 if a crash lost it after the manifest was written. */
+function ensureFence(paths: StorePaths, runtime: StoreRuntime): void {
+  const fence = join(paths.bundles, FORMAT_FENCE);
+  if (!existsSync(fence)) {
+    mkdirSync(paths.bundles, { recursive: true });
+    createExclusive(runtime, fence, FENCE_BYTES);
+  }
 }
 
 /**
@@ -284,7 +289,9 @@ export async function initStore(root: string, now: string, context?: StoreContex
  * refused with nothing changed.
  */
 function upgradeIfV1(paths: StorePaths, now: string, runtime: StoreRuntime): void {
-  if (existsSync(paths.manifest) && frozenKeysOfV1(paths) !== undefined) migrateStore(paths, now, runtime);
+  if (!existsSync(paths.manifest)) return;
+  if (frozenKeysOfV1(paths) !== undefined) migrateStore(paths, now, runtime);
+  else ensureFence(paths, runtime); // a crash after the manifest write can have lost the fence
 }
 
 /** The base key list if the manifest is still version 1, otherwise undefined (including while it is mid-write). */
