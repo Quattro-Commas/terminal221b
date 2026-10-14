@@ -927,6 +927,7 @@ async function claimRevision(
     const revision = (listRevisions(runtime, paths, entry).at(-1) ?? 0) + 1;
     await runtime.step('put:before-claim');
     if (createExclusive(runtime, bundlePathFor(paths, entry, revision), bytes)) return revision;
+    if (attempt === MAX_CLAIM_ATTEMPTS) break;
     const jitter = BACKOFF_MIN_MS + Math.floor(Math.random() * (BACKOFF_MAX_MS - BACKOFF_MIN_MS + 1));
     await runtime.sleep(jitter);
   }
