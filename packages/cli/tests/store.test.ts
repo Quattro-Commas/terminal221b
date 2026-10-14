@@ -402,7 +402,7 @@ describe('store root and layout', () => {
     await initStore(root, FIXTURE_NOW);
     expect(readManifest(root)).toEqual({ version: 1, trustedKeys: [] });
     expect(readdirSync(root).sort()).toEqual(
-      expect.arrayContaining(['bundles', 'manifest.json', 'objects', 'transitions.jsonl'])
+      expect.arrayContaining(['bundles', 'manifest.json', 'objects', 'transitions.d'])
     );
   });
 
@@ -548,8 +548,7 @@ describe('accepting a bundle', () => {
     await initStore(root, FIXTURE_NOW);
     trustKey(root, { keyId: KEY_ID, publicKey }, FIXTURE_NOW);
     await putBundle(root, signedFixture, { now: FIXTURE_NOW, baseDir: baseDir() });
-    const lines = readFileSync(join(root, 'transitions.jsonl'), 'utf8').trim().split('\n');
-    expect(lines.map((line) => JSON.parse(line).action)).toEqual(['init', 'trust', 'put']);
+    expect(readTransitions(root).map((line) => line.action)).toEqual(['init', 'trust', 'put']);
   });
 
   it('files a multi-case bundle under the first case, keeping one scope per entry', async () => {

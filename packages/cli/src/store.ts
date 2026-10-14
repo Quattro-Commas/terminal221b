@@ -27,7 +27,6 @@ import {
 } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import {
-  appendFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -36,7 +35,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { isAbsolute, join, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   ApprovalRecord,
@@ -50,6 +49,8 @@ import {
 import {
   createExclusive,
   errnoCode,
+  appendWhole,
+  frameLine,
   resolveContext,
   writeDurable as writeDurableWith,
   type StoreContext,
@@ -175,7 +176,10 @@ export interface StorePaths {
   manifest: string;
   bundles: string;
   objects: string;
+  /** Legacy shared append log. Read when present, never written by this version. */
   transitions: string;
+  /** One log file per writer process; see recordTransition. */
+  transitionsDir: string;
   lock: string;
 }
 
@@ -207,6 +211,7 @@ export function storePaths(root: string): StorePaths {
     bundles: join(at, 'bundles'),
     objects: join(at, 'objects'),
     transitions: join(at, 'transitions.jsonl'),
+    transitionsDir: join(at, 'transitions.d'),
     lock: join(at, '.lock'),
   };
 }
@@ -251,14 +256,15 @@ function isProcessAlive(pid: number): boolean {
 /* Manifest                                                                     */
 /* -------------------------------------------------------------------------- */
 
-export async function initStore(root: string, now: string): Promise<StorePaths> {
+export async function initStore(root: string, now: string, context?: StoreContext): Promise<StorePaths> {
   const paths = storePaths(root);
+  const runtime = resolveContext(context);
   mkdirSync(paths.bundles, { recursive: true });
   mkdirSync(paths.objects, { recursive: true });
   if (!existsSync(paths.transitions)) writeFileSync(paths.transitions, '');
   if (!existsSync(paths.manifest)) {
-    writeDurableWith(resolveContext(), paths.manifest, `${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: [] }, null, 2)}\n`);
-    recordTransition(paths, { at: now, action: 'init', detail: `store initialised at ${paths.root}` });
+    writeDurableWith(runtime, paths.manifest, `${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: [] }, null, 2)}\n`);
+    recordTransition(runtime, paths, { at: now, action: 'init', detail: `store initialised at ${paths.root}` });
   }
   return paths;
 }
@@ -284,9 +290,11 @@ export function readManifest(root: string): StoreManifest {
 export function trustKey(
   root: string,
   key: { keyId: string; publicKey: KeyObject | Buffer; label?: string },
-  now: string
+  now: string,
+  context?: StoreContext
 ): TrustedKey {
   const paths = storePaths(root);
+  const runtime = resolveContext(context);
   const manifest = readManifest(root);
   if (manifest.trustedKeys.some((entry) => entry.keyId === key.keyId)) {
     throw new Error(`keyId ${key.keyId} is already trusted; choose another keyId or remove the entry first`);
@@ -306,8 +314,8 @@ export function trustKey(
   };
   const next: StoreManifest = { version: SCHEMA_VERSION, trustedKeys: [...manifest.trustedKeys, entry] };
   withStoreLock(paths, () => {
-    writeDurableWith(resolveContext(), paths.manifest, `${JSON.stringify(next, null, 2)}\n`);
-    recordTransition(paths, { at: now, action: 'trust', detail: `trusted key ${key.keyId}` });
+    writeDurableWith(runtime, paths.manifest, `${JSON.stringify(next, null, 2)}\n`);
+    recordTransition(runtime, paths, { at: now, action: 'trust', detail: `trusted key ${key.keyId}` });
   });
   return entry;
 }
@@ -344,17 +352,127 @@ export interface Transition {
   bundleDigest?: string;
 }
 
-function recordTransition(paths: StorePaths, transition: Transition): void {
-  appendFileSync(paths.transitions, `${JSON.stringify(transition)}\n`);
+/** Well under PIPE_BUF-scale sizes, so one append stays one write on a local filesystem. */
+const MAX_LINE_BYTES = 4096;
+
+/** Fits `transition` into one log line by shortening its free-text detail, never its identifying fields. */
+function boundedLine(transition: Transition): string {
+  let current = transition;
+  let json = JSON.stringify(current);
+  while (Buffer.byteLength(json) + 2 > MAX_LINE_BYTES && current.detail) {
+    const keep = Math.floor(current.detail.length / 2);
+    current = { ...current, detail: keep > 0 ? `${current.detail.slice(0, keep)}...` : undefined };
+    json = JSON.stringify(current);
+  }
+  if (Buffer.byteLength(json) + 2 > MAX_LINE_BYTES) {
+    throw new Error('a transition line exceeds the 4 KB log line limit even without its detail');
+  }
+  return json;
+}
+
+const writerLogs = new Map<string, string>();
+
+function safeHostname(hostname: string): string {
+  const cleaned = hostname.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64);
+  return cleaned === '' ? 'host' : cleaned;
+}
+
+/**
+ * Appends to this writer's own log, `transitions.d/<host>-<pid>-<random>.jsonl`.
+ * Nothing else ever appends to that file, so no two writers interleave bytes in
+ * it even on a filesystem whose O_APPEND is not atomic across hosts (NFS). The
+ * file is created exclusively on first use; the random part keeps a recycled pid
+ * from adopting a dead process's file.
+ *
+ * Each record is one buffer, framed by a leading newline, in one write: a crash
+ * can tear at most the last line, and the next append starts on a fresh line so
+ * the tear never swallows a good record.
+ */
+function recordTransition(runtime: StoreRuntime, paths: StorePaths, transition: Transition): void {
+  const line = frameLine(boundedLine(transition));
+  const key = `${paths.root}\0${runtime.hostname}\0${runtime.pid}`;
+  const known = writerLogs.get(key);
+  if (known !== undefined) {
+    try {
+      appendWhole(runtime, known, line, false);
+      return;
+    } catch (error) {
+      if (errnoCode(error) !== 'ENOENT') throw error;
+      writerLogs.delete(key);
+    }
+  }
+  mkdirSync(paths.transitionsDir, { recursive: true });
+  const created = join(
+    paths.transitionsDir,
+    `${safeHostname(runtime.hostname)}-${runtime.pid}-${runtime.randomHex(8)}.jsonl`
+  );
+  appendWhole(runtime, created, line, true);
+  writerLogs.set(key, created);
+}
+
+export interface TransitionLog {
+  transitions: Transition[];
+  /** Lines that did not parse, as `file: excerpt`. verify reports them; readers skip them. */
+  unreadable: string[];
+}
+
+/**
+ * Merges the legacy shared log (if any) with every per-writer log. Identical
+ * lines collapse to one, so a purge that was repeated after a crash counts
+ * once. Order across files is not meaningful; consumers look records up by
+ * (entry, revision) and never rely on position.
+ */
+export function readTransitionLog(root: string, runtime: StoreRuntime = resolveContext()): TransitionLog {
+  const paths = storePaths(root);
+  const files: string[] = [];
+  if (existsSync(paths.transitions)) files.push(paths.transitions);
+  let names: string[] = [];
+  try {
+    names = runtime.io.readdir(paths.transitionsDir);
+  } catch (error) {
+    if (errnoCode(error) !== 'ENOENT') throw error;
+  }
+  for (const name of names.sort()) {
+    if (!name.startsWith('.') && name.endsWith('.jsonl')) files.push(join(paths.transitionsDir, name));
+  }
+  const seen = new Set<string>();
+  const transitions: Transition[] = [];
+  const unreadable: string[] = [];
+  for (const file of files) {
+    let text: string;
+    try {
+      text = runtime.io.readFile(file).toString('utf8');
+    } catch (error) {
+      if (errnoCode(error) === 'ENOENT') continue;
+      throw error;
+    }
+    for (const raw of text.split('\n')) {
+      const line = raw.trim();
+      if (line === '' || seen.has(line)) continue;
+      seen.add(line);
+      const parsed = parseTransition(line);
+      if (parsed) transitions.push(parsed);
+      else unreadable.push(`${relative(paths.root, file)}: ${line.slice(0, 60)}`);
+    }
+  }
+  return { transitions, unreadable };
+}
+
+function parseTransition(line: string): Transition | undefined {
+  try {
+    const value: unknown = JSON.parse(line);
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const record = value as Record<string, unknown>;
+      if (typeof record.at === 'string' && typeof record.action === 'string') return record as unknown as Transition;
+    }
+  } catch {
+    // An unparseable line is reported by verify, not thrown from a read.
+  }
+  return undefined;
 }
 
 export function readTransitions(root: string): Transition[] {
-  const paths = storePaths(root);
-  if (!existsSync(paths.transitions)) return [];
-  return readFileSync(paths.transitions, 'utf8')
-    .split('\n')
-    .filter((line) => line.trim() !== '')
-    .map((line) => JSON.parse(line) as Transition);
+  return readTransitionLog(root).transitions;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -768,7 +886,7 @@ export async function putBundle(root: string, bundle: CaseBundle, options: PutOp
   await runtime.step('put:object-written');
   const revision = await claimRevision(runtime, paths, entry, bytes);
   await runtime.step('put:claimed');
-  recordTransition(paths, {
+  recordTransition(runtime, paths, {
     at: options.now,
     action: 'put',
     entry,
@@ -1095,9 +1213,11 @@ export function purgeExpired(
   root: string,
   windows: RetentionWindows,
   now: string,
-  token: string
+  token: string,
+  context?: StoreContext
 ): PurgeResult {
   const paths = storePaths(root);
+  const runtime = resolveContext(context);
   const report = retentionReport(root, windows, now);
   if (report.purgeable.length === 0) {
     throw new Error(
@@ -1120,7 +1240,7 @@ export function purgeExpired(
         .filter((row) => row.entry === entry && row.revision === revision && row.status === 'past-window')
         .map((row) => row.sourceId);
       rmSync(bundlePathFor(paths, entry, revision), { force: true });
-      recordTransition(paths, {
+      recordTransition(runtime, paths, {
         at: now,
         action: 'purge',
         entry,
@@ -1240,9 +1360,11 @@ export function loadRetentionPolicy(root: string): RetentionPolicyFile | undefin
 export function saveRetentionPolicy(
   root: string,
   windows: RetentionWindows,
-  now: string
+  now: string,
+  context?: StoreContext
 ): { path: string; overwritten: boolean } {
   const paths = storePaths(root);
+  const runtime = resolveContext(context);
   const at = retentionPolicyPath(paths);
   const existing = existsSync(at);
   mkdirSync(paths.root, { recursive: true });
@@ -1259,8 +1381,8 @@ export function saveRetentionPolicy(
       'A class absent from here is reported unconfigured and is never purged. operator_archive is never purged.',
     windows: ordered as RetentionWindows,
   };
-  writeDurableWith(resolveContext(), at, `${JSON.stringify(file, null, 2)}\n`);
-  recordTransition(paths, {
+  writeDurableWith(runtime, at, `${JSON.stringify(file, null, 2)}\n`);
+  recordTransition(runtime, paths, {
     at: now,
     action: existing ? 'retention-policy-replaced' : 'retention-policy-recorded',
     detail: `windows: ${Object.entries(ordered).map(([key, value]) => `${key}=${value}d`).join(', ') || 'none'}`,
