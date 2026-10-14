@@ -541,6 +541,45 @@ describe('crashes leave only what verify reports', () => {
   });
 });
 
+describe('retentionReport under in-flight and crashed writes', () => {
+  it('keeps the newest vouched revision non-purgeable when a crashed put left a newer unvouched file', async () => {
+    const root = await freshStore('retention-crashed');
+    await put(root, signedX);
+    await put(root, signedY);
+    // A put that claimed revision 3 and died before recording it.
+    writeFileSync(join(root, 'bundles', ENTRY, '3.json'), `${JSON.stringify(signedY, null, 2)}\n`);
+    const report = retentionReport(root, POLICY, FIXTURE_NOW);
+    expect(report.purgeable).toEqual([`${ENTRY}@1`]);
+    const newest = report.rows.filter((row) => row.revision === 2).map((row) => row.status);
+    expect(newest).toContain('past-window-newest-revision');
+    expect(newest).not.toContain('past-window');
+    // The unvouched file is not a purge candidate, or even a row.
+    expect(report.rows.some((row) => row.revision === 3)).toBe(false);
+  });
+
+  it('labels rows from one listing when a put lands mid-report', async () => {
+    const root = await freshStore('retention-midput');
+    await put(root, signedX);
+    const report = retentionReport(root, POLICY, FIXTURE_NOW, {
+      onStep: (name) => {
+        if (name === 'retention:listed') {
+          // Synchronous stand-in for a put landing between steps.
+          const bytes = `${JSON.stringify(signedY, null, 2)}\n`;
+          writeFileSync(join(root, 'bundles', ENTRY, '2.json'), bytes);
+          appendFileSync(
+            join(root, 'transitions.jsonl'),
+            `${JSON.stringify({ at: FIXTURE_NOW, action: 'put', entry: ENTRY, revision: 2, bundleDigest: sha256(bytes) })}\n`
+          );
+        }
+      },
+    });
+    expect(new Set(report.rows.map((row) => row.revision))).toEqual(new Set([1]));
+    expect(report.purgeable).toEqual([]);
+    expect(report.rows.map((row) => row.status)).toContain('past-window-newest-revision');
+    expect(report.rows.map((row) => row.status)).not.toContain('past-window');
+  });
+});
+
 describe('getBundle without a revision', () => {
   it('returns the newest vouched revision, not the newest file', async () => {
     const root = await freshStore('newest-vouched');

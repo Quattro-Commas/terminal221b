@@ -1344,26 +1344,39 @@ function ageInDays(observedAt: string, now: string): number | null {
  * row, so the answer to "what would a purge take" is visible before anyone asks
  * for a purge.
  */
-export function retentionReport(root: string, windows: RetentionWindows, now: string): RetentionReport {
+export function retentionReport(
+  root: string,
+  windows: RetentionWindows,
+  now: string,
+  context?: StoreContext
+): RetentionReport {
   const paths = storePaths(root);
   if (!existsSync(paths.bundles)) {
     return { now, rows: [], counts: emptyCounts(), purgeable: [], token: sha256('retention:empty') };
   }
+  const runtime = resolveContext(context);
+  // One listing feeds both "newest" and the rows, so a put landing mid-report
+  // cannot make a row disagree with the revision it was compared against. Only
+  // vouched revisions count: a crashed or in-flight put leaves an unvouched file
+  // that must neither become "newest" (which would make the real newest vouched
+  // revision purgeable) nor be a purge candidate itself.
+  const vouched = listEntries(paths.root, runtime).filter((stored) => stored.bundleDigest !== undefined);
+  runtime.step('retention:listed');
   const newest = new Map<string, number>();
-  for (const entry of listEntries(paths.root)) {
+  for (const entry of vouched) {
     const current = newest.get(entry.entry);
     if (current === undefined || entry.revision > current) newest.set(entry.entry, entry.revision);
   }
 
   const rows: RetentionRow[] = [];
-  for (const stored of listEntries(paths.root)) {
+  for (const stored of vouched) {
     let bundle: CaseBundle;
     try {
       bundle = parseCaseBundle(JSON.parse(readFileSync(bundlePathFor(paths, stored.entry, stored.revision), 'utf8')));
     } catch (error) {
-      // Purged since it was listed, or a write still in flight: neither has
-      // anything to report here, and verify is where an unparseable one is named.
-      if (errnoCode(error) === 'ENOENT' || stored.bundleDigest === undefined) continue;
+      // Purged since it was listed: nothing to report. An unparseable vouched
+      // revision is corrupt, and verify is where that is named.
+      if (errnoCode(error) === 'ENOENT') continue;
       throw error;
     }
     const isNewest = newest.get(stored.entry) === stored.revision;
@@ -1445,7 +1458,7 @@ export function purgeExpired(
 ): PurgeResult {
   const paths = storePaths(root);
   const runtime = resolveContext(context);
-  const report = retentionReport(root, windows, now);
+  const report = retentionReport(root, windows, now, context);
   if (report.purgeable.length === 0) {
     throw new Error(
       'nothing is past its retention window, so there is nothing to purge; run the report first and look at it'
