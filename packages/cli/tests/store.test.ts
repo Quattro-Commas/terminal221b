@@ -400,7 +400,7 @@ describe('store root and layout', () => {
   it('creates the layout and an empty trust list on init', async () => {
     const root = scratchRoot('init');
     await initStore(root, FIXTURE_NOW);
-    expect(readManifest(root)).toEqual({ version: 1, trustedKeys: [] });
+    expect(readManifest(root)).toEqual({ version: 2, trustedKeys: [] });
     expect(readdirSync(root).sort()).toEqual(
       expect.arrayContaining(['bundles', 'manifest.json', 'objects', 'transitions.d'])
     );
@@ -623,7 +623,9 @@ describe('reading a bundle back out', () => {
     trustKey(root, { keyId: KEY_ID, publicKey }, FIXTURE_NOW);
     await putBundle(root, signedFixture, { now: FIXTURE_NOW, baseDir: baseDir() });
     // Revoke trust by rewriting the manifest: the stored bytes are unchanged.
-    writeFileSync(join(root, 'manifest.json'), JSON.stringify({ version: 1, trustedKeys: [] }));
+    // Trust lives in keys/ as well as the manifest, so revoking means clearing both.
+    writeFileSync(join(root, 'manifest.json'), JSON.stringify({ version: 2, trustedKeys: [] }));
+    rmSync(join(root, 'keys'), { recursive: true, force: true });
     await expect(
       getBundle(root, 'case-exact-in-scope', 1, { now: FIXTURE_NOW, baseDir: baseDir() })
     ).rejects.toThrow(/is unknown-key/);
@@ -634,7 +636,9 @@ describe('reading a bundle back out', () => {
     await initStore(root, FIXTURE_NOW);
     trustKey(root, { keyId: KEY_ID, publicKey }, FIXTURE_NOW);
     await putBundle(root, signedFixture, { now: FIXTURE_NOW, baseDir: baseDir() });
-    writeFileSync(join(root, 'manifest.json'), JSON.stringify({ version: 1, trustedKeys: [] }));
+    // Trust lives in keys/ as well as the manifest, so revoking means clearing both.
+    writeFileSync(join(root, 'manifest.json'), JSON.stringify({ version: 2, trustedKeys: [] }));
+    rmSync(join(root, 'keys'), { recursive: true, force: true });
     const got = await getBundle(root, 'case-exact-in-scope', 1, {
       now: FIXTURE_NOW,
       baseDir: baseDir(),

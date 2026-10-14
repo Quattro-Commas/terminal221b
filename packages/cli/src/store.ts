@@ -57,7 +57,9 @@ import {
   type StoreRuntime,
 } from './store-io.js';
 
-const SCHEMA_VERSION = 1;
+/** What a fresh store is written as. Version 1 stores are still read, and migrated by initStore. */
+const SCHEMA_VERSION = 2;
+const READABLE_VERSIONS: readonly number[] = [1, 2];
 /** Bumping this changes what a signature commits to, so old signatures stop verifying. */
 export const SIGNATURE_CONTEXT = 'terminal221b/record-signature/v1';
 
@@ -176,6 +178,8 @@ export interface StorePaths {
   manifest: string;
   bundles: string;
   objects: string;
+  /** One file per trusted key, `<sha256(keyId) hex>.json`, created exclusively. */
+  keys: string;
   /** Legacy shared append log. Read when present, never written by this version. */
   transitions: string;
   /** One log file per writer process; see recordTransition. */
@@ -210,6 +214,7 @@ export function storePaths(root: string): StorePaths {
     manifest: join(at, 'manifest.json'),
     bundles: join(at, 'bundles'),
     objects: join(at, 'objects'),
+    keys: join(at, 'keys'),
     transitions: join(at, 'transitions.jsonl'),
     transitionsDir: join(at, 'transitions.d'),
     lock: join(at, '.lock'),
@@ -256,19 +261,101 @@ function isProcessAlive(pid: number): boolean {
 /* Manifest                                                                     */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Creates the store, or finishes creating one, or upgrades a version 1 store.
+ * There is no lock to wait on and nothing here fails because another process is
+ * active: the directories are `mkdir -p`, the manifest is claimed with an
+ * exclusive create, and only the process that created it records `init`.
+ */
 export async function initStore(root: string, now: string, context?: StoreContext): Promise<StorePaths> {
   const paths = storePaths(root);
   const runtime = resolveContext(context);
-  mkdirSync(paths.bundles, { recursive: true });
-  mkdirSync(paths.objects, { recursive: true });
-  if (!existsSync(paths.transitions)) writeFileSync(paths.transitions, '');
-  if (!existsSync(paths.manifest)) {
-    writeDurableWith(runtime, paths.manifest, `${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: [] }, null, 2)}\n`);
-    recordTransition(runtime, paths, { at: now, action: 'init', detail: `store initialised at ${paths.root}` });
+  for (const dir of [paths.bundles, paths.objects, paths.keys, paths.transitionsDir]) {
+    mkdirSync(dir, { recursive: true });
   }
+  runtime.step('init:before-manifest');
+  const fresh = createExclusive(
+    runtime,
+    paths.manifest,
+    Buffer.from(`${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: [] }, null, 2)}\n`, 'utf8')
+  );
+  if (fresh) {
+    recordTransition(runtime, paths, { at: now, action: 'init', detail: `store initialised at ${paths.root}` });
+    return paths;
+  }
+  const frozen = frozenKeysOfV1(paths);
+  if (frozen !== undefined) migrateStore(paths, frozen, now, runtime);
   return paths;
 }
 
+/** The base key list if the manifest is still version 1, otherwise undefined (including while it is mid-write). */
+function frozenKeysOfV1(paths: StorePaths): TrustedKey[] | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(paths.manifest, 'utf8'));
+  } catch (error) {
+    if (error instanceof SyntaxError || errnoCode(error) === 'ENOENT') return undefined;
+    throw error;
+  }
+  const value = parsed as { version?: unknown; trustedKeys?: unknown } | null;
+  if (value?.version === 1 && Array.isArray(value.trustedKeys)) return value.trustedKeys as TrustedKey[];
+  return undefined;
+}
+
+export function keyFileName(keyId: string): string {
+  return `${sha256(keyId).slice('sha256:'.length)}.json`;
+}
+
+function isTrustedKey(value: unknown): value is TrustedKey {
+  const record = value as Record<string, unknown> | null;
+  return (
+    !!record &&
+    typeof record === 'object' &&
+    typeof record.keyId === 'string' &&
+    typeof record.publicKeySpkiDerBase64 === 'string'
+  );
+}
+
+/**
+ * The per-key files under keys/. A file that does not parse (the exclusive-create
+ * fallback can expose one mid-write) trusts nothing and is reported rather than
+ * thrown, so one damaged file cannot take the whole store offline.
+ */
+export function readKeyDirectory(
+  root: string,
+  runtime: StoreRuntime = resolveContext()
+): { keys: TrustedKey[]; problems: string[] } {
+  const paths = storePaths(root);
+  let names: string[] = [];
+  try {
+    names = runtime.io.readdir(paths.keys);
+  } catch (error) {
+    if (errnoCode(error) !== 'ENOENT') throw error;
+  }
+  const keys: TrustedKey[] = [];
+  const problems: string[] = [];
+  for (const name of names.sort()) {
+    if (name.startsWith('.') || !name.endsWith('.json')) continue;
+    try {
+      const value: unknown = JSON.parse(runtime.io.readFile(join(paths.keys, name)).toString('utf8'));
+      if (!isTrustedKey(value)) throw new Error('not a trusted key record');
+      if (keyFileName(value.keyId) !== name) throw new Error(`file name does not match keyId ${value.keyId}`);
+      keys.push(value);
+    } catch (error) {
+      if (errnoCode(error) === 'ENOENT') continue;
+      problems.push(`keys/${name} is unusable: ${(error as Error).message}`);
+    }
+  }
+  keys.sort((a, b) => (a.addedAt + a.keyId < b.addedAt + b.keyId ? -1 : 1));
+  return { keys, problems };
+}
+
+/**
+ * The manifest's trustedKeys are a frozen base list: nothing appends to them
+ * any more, because rewriting one shared file is a read-modify-write that loses
+ * a concurrent trust. New keys live one-per-file under keys/, and the trust set
+ * is the union of the two.
+ */
 export function readManifest(root: string): StoreManifest {
   const paths = storePaths(root);
   if (!existsSync(paths.manifest)) {
@@ -279,12 +366,14 @@ export function readManifest(root: string): StoreManifest {
     throw new Error('the store manifest must be a JSON object');
   }
   const value = parsed as Record<string, unknown>;
-  if (value.version !== SCHEMA_VERSION) {
+  if (typeof value.version !== 'number' || !READABLE_VERSIONS.includes(value.version)) {
     throw new Error(`unsupported store manifest version: ${String(value.version)}`);
   }
-  const keys = value.trustedKeys;
-  if (!Array.isArray(keys)) throw new Error('the store manifest must list trustedKeys');
-  return { version: SCHEMA_VERSION, trustedKeys: keys as TrustedKey[] };
+  const frozen = value.trustedKeys;
+  if (!Array.isArray(frozen)) throw new Error('the store manifest must list trustedKeys');
+  const known = new Set((frozen as TrustedKey[]).map((entry) => entry.keyId));
+  const extra = readKeyDirectory(root).keys.filter((entry) => !known.has(entry.keyId));
+  return { version: value.version, trustedKeys: [...(frozen as TrustedKey[]), ...extra] };
 }
 
 export function trustKey(
@@ -295,10 +384,9 @@ export function trustKey(
 ): TrustedKey {
   const paths = storePaths(root);
   const runtime = resolveContext(context);
-  const manifest = readManifest(root);
-  if (manifest.trustedKeys.some((entry) => entry.keyId === key.keyId)) {
-    throw new Error(`keyId ${key.keyId} is already trusted; choose another keyId or remove the entry first`);
-  }
+  const alreadyTrusted = () =>
+    new Error(`keyId ${key.keyId} is already trusted; choose another keyId or remove the entry first`);
+  if (readManifest(root).trustedKeys.some((entry) => entry.keyId === key.keyId)) throw alreadyTrusted();
   const parsedKey = Buffer.isBuffer(key.publicKey)
     ? createPublicKey({ key: key.publicKey, format: 'der', type: 'spki' })
     : key.publicKey;
@@ -312,13 +400,52 @@ export function trustKey(
     ...(key.label === undefined ? {} : { label: key.label }),
     addedAt: now,
   };
-  const next: StoreManifest = { version: SCHEMA_VERSION, trustedKeys: [...manifest.trustedKeys, entry] };
-  withStoreLock(paths, () => {
-    writeDurableWith(runtime, paths.manifest, `${JSON.stringify(next, null, 2)}\n`);
-    recordTransition(runtime, paths, { at: now, action: 'trust', detail: `trusted key ${key.keyId}` });
-  });
+  runtime.step('trust:before-create');
+  mkdirSync(paths.keys, { recursive: true });
+  // The name is derived from the keyId, so two trusts of one keyId collide on
+  // the same file and exactly one wins; different keyIds never contend.
+  const created = createExclusive(
+    runtime,
+    join(paths.keys, keyFileName(key.keyId)),
+    Buffer.from(`${JSON.stringify(entry, null, 2)}\n`, 'utf8')
+  );
+  if (!created) throw alreadyTrusted();
+  recordTransition(runtime, paths, { at: now, action: 'trust', detail: `trusted key ${key.keyId}` });
   return entry;
 }
+
+/**
+ * Brings a version 1 store up to version 2. Idempotent, and safe to run from
+ * several processes: every step is either an exclusive create or a rewrite of
+ * identical bytes.
+ *
+ * bundles/.format-v2 is a regular file where an old CLI expects only entry
+ * directories. Its listEntries readdir()s it as if it were one and fails with
+ * ENOTDIR, so an old binary cannot keep writing a store whose lock it no longer
+ * honours. (The version number fences it as well: an old readManifest rejects 2.)
+ * Entry names cannot collide with it, because they must start alphanumeric.
+ */
+export function migrateStore(
+  paths: StorePaths,
+  frozenKeys: TrustedKey[],
+  now: string,
+  runtime: StoreRuntime
+): void {
+  mkdirSync(paths.keys, { recursive: true });
+  mkdirSync(paths.transitionsDir, { recursive: true });
+  createExclusive(runtime, join(paths.bundles, FORMAT_FENCE), FENCE_BYTES);
+  runtime.step('migrate:fenced');
+  writeDurableWith(
+    runtime,
+    paths.manifest,
+    `${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: frozenKeys }, null, 2)}\n`
+  );
+  recordTransition(runtime, paths, { at: now, action: 'migrate', detail: 'store layout upgraded from version 1 to 2' });
+}
+
+/** Skipped by every directory listing of bundles/; see migrateStore. */
+const FORMAT_FENCE = '.format-v2';
+const FENCE_BYTES = Buffer.from('terminal221b case store format 2\n');
 
 function trustedKeyObjects(manifest: StoreManifest): Map<string, KeyObject> {
   const out = new Map<string, KeyObject>();
@@ -956,6 +1083,7 @@ export function listEntries(root: string): StoreEntry[] {
   const transitions = readTransitions(root);
   const entries: StoreEntry[] = [];
   for (const name of readdirSync(paths.bundles).sort()) {
+    if (name.startsWith('.')) continue;
     const dir = join(paths.bundles, name);
     if (!existsSync(dir)) continue;
     for (const revision of listRevisions(resolveContext(), paths, name)) {
