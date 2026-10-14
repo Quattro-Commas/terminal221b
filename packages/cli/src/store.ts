@@ -1128,7 +1128,13 @@ export function listEntries(root: string, runtime: StoreRuntime = resolveContext
   return entries;
 }
 
-const LEFTOVER = /\.tmp-|^\.condemned-/;
+/**
+ * Exactly the names `tempNameFor` (`.<name>.tmp-<hex>`) and `collectObject`
+ * (`.condemned-<digest>-<hex>`) produce. Both start with a dot, which no entry
+ * or revision name can (SAFE_ENTRY starts alphanumeric), so a valid entry such
+ * as `build.tmp-2` is never mistaken for a leftover.
+ */
+const LEFTOVER = /^\..+\.tmp-[0-9a-f]+$|^\.condemned-.+-[0-9a-f]+$/;
 
 /**
  * Temp and condemned files are what an interrupted write or purge leaves. Readers

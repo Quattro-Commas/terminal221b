@@ -456,6 +456,23 @@ describe('the transition log', () => {
 });
 
 describe('crashes leave only what verify reports', () => {
+  it('does not report a valid entry whose name contains .tmp-', async () => {
+    const root = await freshStore('tmp-name');
+    await putBundle(root, signedX, { now: FIXTURE_NOW, baseDir: BASE, entry: 'build.tmp-2' });
+    await putBundle(root, signedX, { now: FIXTURE_NOW, baseDir: BASE, entry: 'condemned-x.tmp-' });
+    expect((await verifyStore(root, { now: FIXTURE_NOW, baseDir: BASE })).problems).toEqual([]);
+  });
+
+  it('still reports the exact temp and condemned shapes the store produces', async () => {
+    const root = await freshStore('tmp-shapes');
+    await put(root);
+    writeFileSync(join(root, 'bundles', ENTRY, '.2.json.tmp-0123456789abcdef'), 'x');
+    writeFileSync(join(root, 'objects', '.condemned-sha256-ab-0123456789abcdef'), 'x');
+    const problems = (await verifyStore(root, { now: FIXTURE_NOW, baseDir: BASE })).problems.join('\n');
+    expect(problems).toMatch(/leftover bundles\/case-exact-in-scope\/\.2\.json\.tmp-0123456789abcdef/);
+    expect(problems).toMatch(/leftover objects\/\.condemned-sha256-ab-0123456789abcdef/);
+  });
+
   it('a crash after the temp write leaves a temp file that readers ignore and verify reports', async () => {
     const root = await freshStore('crash-temp');
     await expect(
