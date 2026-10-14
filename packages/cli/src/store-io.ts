@@ -226,7 +226,14 @@ export function createExclusive(runtime: StoreRuntime, final: string, bytes: Buf
     }
     runtime.step('create:linked');
   } finally {
-    removeIfPresent(runtime.io, temp);
+    // The temp is only scaffolding. Once the link succeeded the claim is made,
+    // and an unlink failure here must neither undo it nor mask the error that
+    // got us here; a stranded temp is a leftover that verify reports.
+    try {
+      removeIfPresent(runtime.io, temp);
+    } catch {
+      // see above
+    }
   }
   if (won) fsyncDir(dir);
   return won;

@@ -317,6 +317,33 @@ describe('createExclusive', () => {
     expect(readdirSync(dir)).toEqual([]);
   });
 
+  it('keeps the win when removing the temp file fails after the link succeeded', () => {
+    const dir = scratch('excl-unlink-fails');
+    const runtime = resolveContext({
+      io: {
+        unlink: (path) => {
+          if (path.includes('.tmp-')) throw errno('EIO');
+          nodeIO.unlink(path);
+        },
+      },
+    });
+    expect(createExclusive(runtime, join(dir, 'a.json'), Buffer.from('mine'))).toBe(true);
+    expect(readFileSync(join(dir, 'a.json'), 'utf8')).toBe('mine');
+    // The stranded temp is what verify reports, not an error to the winner.
+    expect(readdirSync(dir).filter((name) => name.includes('.tmp-'))).toHaveLength(1);
+  });
+
+  it('does not let a failing temp cleanup mask the original error', () => {
+    const dir = scratch('excl-unlink-masks');
+    const runtime = resolveContext({
+      io: { unlink: () => { throw errno('EIO'); } },
+      onStep: (name) => {
+        if (name === 'create:temp-written') throw errno('ENOSPC');
+      },
+    });
+    expect(() => createExclusive(runtime, join(dir, 'a.json'), Buffer.from('x'))).toThrow(/ENOSPC/);
+  });
+
   it('removes a file it created when writing its bytes fails', () => {
     const dir = scratch('excl-open-fail');
     // Not a Buffer: writeSync rejects it after the file has been created.
