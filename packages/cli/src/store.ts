@@ -28,20 +28,15 @@ import {
 import { createReadStream } from 'node:fs';
 import {
   appendFileSync,
-  closeSync,
   existsSync,
-  fsyncSync,
   mkdirSync,
-  openSync,
   readFileSync,
   readdirSync,
-  renameSync,
   rmSync,
   writeFileSync,
-  writeSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   ApprovalRecord,
@@ -52,6 +47,7 @@ import {
   RETENTION_CLASSES,
   validateCaseBundle,
 } from './case.js';
+import { resolveContext, writeDurable as writeDurableWith } from './store-io.js';
 
 const SCHEMA_VERSION = 1;
 /** Bumping this changes what a signature commits to, so old signatures stop verifying. */
@@ -212,45 +208,6 @@ export function storePaths(root: string): StorePaths {
 /* Durable writes                                                               */
 /* -------------------------------------------------------------------------- */
 
-function fsyncDir(path: string): void {
-  let fd: number | undefined;
-  try {
-    fd = openSync(path, 'r');
-    fsyncSync(fd);
-  } catch {
-    // A directory that cannot be opened for reading cannot be fsynced; the
-    // rename below is still atomic, so the write is safe without this.
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-  }
-}
-
-/**
- * temp file -> fsync -> rename -> fsync parent. The rename is the atomic step,
- * so a reader never observes a half-written bundle or manifest.
- */
-function writeDurable(path: string, bytes: Buffer | string): void {
-  const target = resolve(path);
-  const parent = dirname(target);
-  mkdirSync(parent, { recursive: true });
-  const temp = join(parent, `.${basenameOf(target)}.tmp-${process.pid}`);
-  const fd = openSync(temp, 'w');
-  try {
-    if (Buffer.isBuffer(bytes)) writeSync(fd, bytes);
-    else writeSync(fd, bytes);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(temp, target);
-  fsyncDir(parent);
-}
-
-function basenameOf(path: string): string {
-  const parts = resolve(path).split(sep);
-  return parts[parts.length - 1];
-}
-
 /**
  * A cooperative lock: advisory, taken by writing our pid, released by removing
  * it. Two concurrent `put`s in the same store would otherwise both compute the
@@ -293,7 +250,7 @@ export async function initStore(root: string, now: string): Promise<StorePaths> 
   mkdirSync(paths.objects, { recursive: true });
   if (!existsSync(paths.transitions)) writeFileSync(paths.transitions, '');
   if (!existsSync(paths.manifest)) {
-    writeDurable(paths.manifest, `${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: [] }, null, 2)}\n`);
+    writeDurableWith(resolveContext(), paths.manifest, `${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: [] }, null, 2)}\n`);
     recordTransition(paths, { at: now, action: 'init', detail: `store initialised at ${paths.root}` });
   }
   return paths;
@@ -342,7 +299,7 @@ export function trustKey(
   };
   const next: StoreManifest = { version: SCHEMA_VERSION, trustedKeys: [...manifest.trustedKeys, entry] };
   withStoreLock(paths, () => {
-    writeDurable(paths.manifest, `${JSON.stringify(next, null, 2)}\n`);
+    writeDurableWith(resolveContext(), paths.manifest, `${JSON.stringify(next, null, 2)}\n`);
     recordTransition(paths, { at: now, action: 'trust', detail: `trusted key ${key.keyId}` });
   });
   return entry;
@@ -737,8 +694,8 @@ export async function putBundle(root: string, bundle: CaseBundle, options: PutOp
 
   return withStoreLock(paths, () => {
     const revision = (listRevisions(paths, entry).at(-1) ?? 0) + 1;
-    writeDurable(bundlePathFor(paths, entry, revision), serialized);
-    writeDurable(join(paths.objects, bundleDigest.replace(':', '-')), serialized);
+    writeDurableWith(resolveContext(), bundlePathFor(paths, entry, revision), serialized);
+    writeDurableWith(resolveContext(), join(paths.objects, bundleDigest.replace(':', '-')), serialized);
     recordTransition(paths, {
       at: options.now,
       action: 'put',
@@ -1226,7 +1183,7 @@ export function saveRetentionPolicy(
       'A class absent from here is reported unconfigured and is never purged. operator_archive is never purged.',
     windows: ordered as RetentionWindows,
   };
-  writeDurable(at, `${JSON.stringify(file, null, 2)}\n`);
+  writeDurableWith(resolveContext(), at, `${JSON.stringify(file, null, 2)}\n`);
   recordTransition(paths, {
     at: now,
     action: existing ? 'retention-policy-replaced' : 'retention-policy-recorded',
