@@ -258,20 +258,41 @@ function basenameOf(path: string): string {
  */
 export function withStoreLock<T>(paths: StorePaths, body: () => T): T {
   mkdirSync(paths.root, { recursive: true });
-  if (existsSync(paths.lock)) {
-    const holder = readFileSync(paths.lock, 'utf8').trim();
-    const alive = /^\d+$/.test(holder) && isProcessAlive(Number(holder));
-    if (alive) {
-      throw new Error(`the case store is locked by process ${holder}`);
-    }
-    rmSync(paths.lock, { force: true });
-  }
-  writeFileSync(paths.lock, `${process.pid}\n`);
+  takeLock(paths.lock);
   try {
     return body();
   } finally {
     rmSync(paths.lock, { force: true });
   }
+}
+
+/**
+ * Takes the lock with an exclusive create, so two processes can never both
+ * believe they hold it (an exists-check followed by a write let both through).
+ * A lock whose holder is gone is removed and the exclusive create tried once
+ * more. What is left: two processes taking over the same stale lock at the same
+ * moment can still race on its removal; that needs a stale lock to exist first.
+ */
+function takeLock(lock: string): void {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      writeFileSync(lock, `${process.pid}\n`, { flag: 'wx' });
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+    let holder: string;
+    try {
+      holder = readFileSync(lock, 'utf8').trim();
+    } catch {
+      continue; // released between our create and this read: try the create again
+    }
+    if (/^\d+$/.test(holder) && isProcessAlive(Number(holder))) {
+      throw new Error(`the case store is locked by process ${holder}`);
+    }
+    rmSync(lock, { force: true });
+  }
+  throw new Error('the case store lock could not be taken');
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -291,7 +312,9 @@ export async function initStore(root: string, now: string): Promise<StorePaths> 
   const paths = storePaths(root);
   mkdirSync(paths.bundles, { recursive: true });
   mkdirSync(paths.objects, { recursive: true });
-  if (!existsSync(paths.transitions)) writeFileSync(paths.transitions, '');
+  // Append mode creates the file if it is missing and never truncates it, with no
+  // exists-check in between.
+  writeFileSync(paths.transitions, '', { flag: 'a' });
   if (!existsSync(paths.manifest)) {
     writeDurable(paths.manifest, `${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: [] }, null, 2)}\n`);
     recordTransition(paths, { at: now, action: 'init', detail: `store initialised at ${paths.root}` });

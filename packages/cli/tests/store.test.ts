@@ -14,6 +14,8 @@ import {
   entryName,
   getBundle,
   initStore,
+  storePaths,
+  withStoreLock,
   loadRetentionPolicy,
   localPathFor,
   payloadDigestOf,
@@ -426,9 +428,9 @@ describe('store root and layout', () => {
     const pem = privateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
     const marker = pem.split('\n')[1];
     const walk = (dir: string): void => {
-      for (const name of readdirSync(dir)) {
-        const at = join(dir, name);
-        if (statSync(at).isDirectory()) walk(at);
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const at = join(dir, entry.name);
+        if (entry.isDirectory()) walk(at);
         else expect(readFileSync(at, 'utf8')).not.toContain(marker);
       }
     };
@@ -1122,5 +1124,35 @@ describe('the retention policy is a file the operator edits, not a code default'
 
   it('ships a starting policy that is a position, not a measurement', () => {
     expect(DEFAULT_RETENTION_POLICY).toEqual({ transient: 7, case_metadata: 180, local_diff: 180 });
+  });
+});
+
+describe('the store lock', () => {
+  it('refuses a second taker while it is held, and is released afterwards', () => {
+    const paths = storePaths(scratchRoot('lock-held'));
+    withStoreLock(paths, () => {
+      expect(() => withStoreLock(paths, () => 'second')).toThrow(/locked by process/);
+    });
+    expect(existsSync(paths.lock)).toBe(false);
+    expect(withStoreLock(paths, () => 'after')).toBe('after');
+  });
+
+  it('takes over a lock left by a process that is gone', () => {
+    const paths = storePaths(scratchRoot('lock-stale'));
+    mkdirSync(paths.root, { recursive: true });
+    for (const holder of ['999999999\n', 'not a pid\n']) {
+      writeFileSync(paths.lock, holder);
+      expect(withStoreLock(paths, () => readFileSync(paths.lock, 'utf8'))).toBe(`${process.pid}\n`);
+      expect(existsSync(paths.lock)).toBe(false);
+    }
+  });
+
+  it('initStore never truncates the transitions already recorded', async () => {
+    const root = scratchRoot('init-keep');
+    const paths = await initStore(root, FIXTURE_NOW);
+    const before = readFileSync(paths.transitions, 'utf8');
+    expect(before.length).toBeGreaterThan(0);
+    await initStore(root, FIXTURE_NOW);
+    expect(readFileSync(paths.transitions, 'utf8')).toBe(before);
   });
 });
