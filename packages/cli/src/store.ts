@@ -31,8 +31,6 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
-  rmSync,
-  writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
@@ -184,7 +182,6 @@ export interface StorePaths {
   transitions: string;
   /** One log file per writer process; see recordTransition. */
   transitionsDir: string;
-  lock: string;
 }
 
 /**
@@ -217,45 +214,12 @@ export function storePaths(root: string): StorePaths {
     keys: join(at, 'keys'),
     transitions: join(at, 'transitions.jsonl'),
     transitionsDir: join(at, 'transitions.d'),
-    lock: join(at, '.lock'),
   };
 }
 
 /* -------------------------------------------------------------------------- */
 /* Durable writes                                                               */
 /* -------------------------------------------------------------------------- */
-
-/**
- * A cooperative lock: advisory, taken by writing our pid, released by removing
- * it. Two concurrent `put`s in the same store would otherwise both compute the
- * next revision from the same on-disk state and one would overwrite the other.
- */
-export function withStoreLock<T>(paths: StorePaths, body: () => T): T {
-  mkdirSync(paths.root, { recursive: true });
-  if (existsSync(paths.lock)) {
-    const holder = readFileSync(paths.lock, 'utf8').trim();
-    const alive = /^\d+$/.test(holder) && isProcessAlive(Number(holder));
-    if (alive) {
-      throw new Error(`the case store is locked by process ${holder}`);
-    }
-    rmSync(paths.lock, { force: true });
-  }
-  writeFileSync(paths.lock, `${process.pid}\n`);
-  try {
-    return body();
-  } finally {
-    rmSync(paths.lock, { force: true });
-  }
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 /* -------------------------------------------------------------------------- */
 /* Manifest                                                                     */
