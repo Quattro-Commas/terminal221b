@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -92,6 +93,27 @@ describe('readBoundedFile', () => {
     const root = await makeDirectory();
     await mkdir(join(root, 'dir.ts'));
     expect(await readBoundedFile(join(root, 'dir.ts'), 100, root)).toEqual({ kind: 'skipped', reason: 'not-a-regular-file' });
+  });
+
+  it('reads a file whose name starts with two dots: it is inside the root', async () => {
+    const root = await makeDirectory();
+    await writeFile(join(root, '..cache.ts'), 'export const c = 1;');
+    expect(await readBoundedFile(join(root, '..cache.ts'), 100, root)).toMatchObject({ kind: 'read', bytes: 19 });
+  });
+
+  it('skips a socket instead of aborting the scan', async () => {
+    if (process.platform === 'win32') return;
+    const root = await makeDirectory();
+    const server = createServer();
+    await new Promise<void>((done) => server.listen(join(root, 'sock.ts'), done));
+    try {
+      expect(await readBoundedFile(join(root, 'sock.ts'), 100, root)).toEqual({
+        kind: 'skipped',
+        reason: 'not-a-regular-file',
+      });
+    } finally {
+      await new Promise<void>((done) => server.close(() => done()));
+    }
   });
 
   it('still raises an error it does not understand, as readFile did', async () => {

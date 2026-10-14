@@ -15,7 +15,7 @@ Thumbs.db
 .vscode/
 *.pyc
 __pycache__/
-node_modules/
+node_modules
 target/
 .expo/
 .expo-shared/
