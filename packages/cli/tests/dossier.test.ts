@@ -322,3 +322,25 @@ function rustFieldNames(source: string): Map<string, string[]> {
 }
 
 
+
+describe('table cells cannot be broken by their own text', () => {
+  // GitHub-flavoured markdown ends a cell at a pipe not escaped by an odd run of backslashes.
+  const cellBreaks = (row: string): number => {
+    let breaks = 0;
+    for (let i = 0; i < row.length; i += 1) {
+      if (row[i] !== '|') continue;
+      let slashes = 0;
+      for (let j = i - 1; j >= 0 && row[j] === '\\'; j -= 1) slashes += 1;
+      if (slashes % 2 === 0) breaks += 1;
+    }
+    return breaks;
+  };
+
+  it.each(['plain', 'a|b', 'x\\|y', 'ends with \\', '\\\\|', 'many \\\\\\| here'])(
+    'keeps %j in one cell',
+    async (value) => {
+      const { safeCell } = await import('../src/dossier.js');
+      expect(cellBreaks(`| ${safeCell(value)} |`)).toBe(2);
+    }
+  );
+});
