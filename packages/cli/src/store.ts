@@ -48,7 +48,7 @@ import {
   readdirSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   ApprovalRecord,
@@ -1273,6 +1273,32 @@ function findLeftovers(paths: StorePaths, runtime: StoreRuntime): string[] {
   return out;
 }
 
+/**
+ * putBundle writes the object before it claims a revision, so a put that fails
+ * or crashes in between (or loses a contended claim) leaves an object that no
+ * revision references. Report only: there is no clock to say it is not an
+ * in-flight put, so like the other leftovers it can be transient.
+ */
+function findOrphanObjects(paths: StorePaths, runtime: StoreRuntime, entries: StoreEntry[]): string[] {
+  const referenced = new Set(
+    entries.flatMap((entry) => (entry.bundleDigest === undefined ? [] : [basename(objectPathFor(paths, entry.bundleDigest))]))
+  );
+  let names: string[];
+  try {
+    names = runtime.io.readdir(paths.objects);
+  } catch (error) {
+    if (errnoCode(error) === 'ENOENT') return [];
+    throw error;
+  }
+  return names
+    .sort()
+    .filter((name) => !name.startsWith('.') && !referenced.has(name))
+    .map(
+      (name) =>
+        `objects/${name} is referenced by no vouched revision: a put that failed or crashed before claiming a revision left it behind`
+    );
+}
+
 /** Re-checks every stored bundle against the manifest keys and the local bytes. */
 export async function verifyStore(
   root: string,
@@ -1289,6 +1315,7 @@ export async function verifyStore(
   problems.push(...readTransitionLog(root, runtime).unreadable.map((line) => `unreadable transition line in ${line}`));
   problems.push(...readKeyDirectory(root, runtime).problems);
   problems.push(...findLeftovers(paths, runtime));
+  problems.push(...findOrphanObjects(paths, runtime, entries));
   for (const entry of entries) {
     let stored: string;
     try {

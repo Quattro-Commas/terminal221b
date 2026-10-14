@@ -487,6 +487,24 @@ describe('crashes leave only what verify reports', () => {
     expect(problems).toMatch(/leftover objects\/\.condemned-sha256-ab-0123456789abcdef/);
   });
 
+  it('reports an object that no vouched revision references, after a put that failed before claiming', async () => {
+    const root = await freshStore('orphan-object');
+    await put(root, signedX);
+    expect((await verifyStore(root, { now: FIXTURE_NOW, baseDir: BASE })).problems).toEqual([]);
+    await expect(
+      put(root, signedY, {
+        onStep: (name) => {
+          if (name === 'put:before-claim') throw new Error('crash');
+        },
+      })
+    ).rejects.toThrow(/crash/);
+    const orphan = `objects/${sha256(`${JSON.stringify(signedY, null, 2)}\n`).replace(':', '-')}`;
+    const report = await verifyStore(root, { now: FIXTURE_NOW, baseDir: BASE });
+    expect(report.problems).toEqual([expect.stringContaining(`${orphan} is referenced by no vouched revision`)]);
+    // Report only: nothing was deleted.
+    expect(existsSync(join(root, orphan))).toBe(true);
+  });
+
   it('a crash after the temp write leaves a temp file that readers ignore and verify reports', async () => {
     const root = await freshStore('crash-temp');
     await expect(
