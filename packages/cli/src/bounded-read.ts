@@ -25,8 +25,9 @@ function within(root: string, candidate: string): boolean {
  * The scanners used to `lstat` a path and then `readFile` it. Between the two calls
  * the file, or one of its parent directories, could be replaced by a symlink to
  * somewhere outside the workspace, or the file could grow past the cap. Here:
- *  - `lstat` first, so the size rule and its order are unchanged (an unreadable
- *    file over the cap is still skipped, not an error);
+ *  - no check before the open (a check-then-open is the race this replaces); an
+ *    unreadable file over the cap is still skipped, not an error, as under the old
+ *    `lstat` size check, by looking at its size only after the open failed;
  *  - one `open` with `O_NOFOLLOW` (a symlinked file fails to open) and `O_NONBLOCK`
  *    (a file swapped for a FIFO cannot hang the scan);
  *  - type and size taken from the handle;
@@ -39,11 +40,6 @@ function within(root: string, candidate: string): boolean {
  * Errors other than "this is a symlink" are raised, as `readFile` raised them.
  */
 export async function readBoundedFile(path: string, maxBytes: number, root: string): Promise<BoundedRead> {
-  const before = await lstat(path);
-  if (before.isSymbolicLink()) return { kind: 'skipped', reason: 'symlink' };
-  if (!before.isFile()) return { kind: 'skipped', reason: 'not-a-regular-file' };
-  if (before.size > maxBytes) return { kind: 'skipped', reason: 'too-large' };
-
   let handle;
   try {
     handle = await open(
@@ -51,8 +47,15 @@ export async function readBoundedFile(path: string, maxBytes: number, root: stri
       constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)
     );
   } catch (error) {
-    if (SYMLINK_OPEN_ERRORS.has((error as NodeJS.ErrnoException).code ?? '')) {
-      return { kind: 'skipped', reason: 'symlink' };
+    const code = (error as NodeJS.ErrnoException).code ?? '';
+    if (SYMLINK_OPEN_ERRORS.has(code)) return { kind: 'skipped', reason: 'symlink' };
+    if (code === 'EISDIR') return { kind: 'skipped', reason: 'not-a-regular-file' };
+    if (code === 'EACCES' || code === 'EPERM') {
+      // The old size check needed no read permission, so an unreadable file over the
+      // cap was skipped, not an error. Keep that: look at its size only after the open
+      // failed, and never open it again.
+      const size = await lstat(path).then((s) => s.size, () => undefined);
+      if (size !== undefined && size > maxBytes) return { kind: 'skipped', reason: 'too-large' };
     }
     throw error;
   }
