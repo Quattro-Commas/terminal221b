@@ -1078,7 +1078,18 @@ export async function getBundle(
   }
   const signatures = verifyBundleSignatures(bundle, trustedKeyObjects(manifest));
   const sources = await checkSourceDigests(bundle, options);
+  // The same two rules verifyStore applies. The digest compared against is the
+  // one the put recorded in the log; hashing the bytes just read and comparing
+  // them to themselves would pass by construction.
+  const recorded = transitions.find((line) => isVouching(line, entry, target))?.bundleDigest;
+  const provenance =
+    recorded === undefined
+      ? [`${entry} revision ${target} has no transition recording its digest, so nothing vouches for these bytes`]
+      : sha256(stored) !== recorded
+        ? [`${entry} revision ${target} no longer hashes to its recorded digest`]
+        : [];
   const problems = [
+    ...provenance,
     ...validateCaseBundle(bundle),
     ...sourceMismatchProblems(sources),
     ...signatures

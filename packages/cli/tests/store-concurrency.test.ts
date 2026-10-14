@@ -580,6 +580,34 @@ describe('retentionReport under in-flight and crashed writes', () => {
   });
 });
 
+describe('getBundle with an explicit revision', () => {
+  const options = { now: FIXTURE_NOW, baseDir: BASE };
+
+  it('refuses a revision no transition vouches for, as verify does', async () => {
+    const root = await freshStore('get-unvouched');
+    await put(root, signedX);
+    writeFileSync(join(root, 'bundles', ENTRY, '2.json'), `${JSON.stringify(signedY, null, 2)}\n`);
+    await expect(getBundle(root, ENTRY, 2, options)).rejects.toThrow(/revision 2.*nothing vouches/);
+    const lenient = await getBundle(root, ENTRY, 2, { ...options, strict: false });
+    expect(lenient.report.ok).toBe(false);
+    expect(lenient.report.problems.join('\n')).toMatch(/revision 2 has no transition recording its digest/);
+    expect((await getBundle(root, ENTRY, 1, options)).report.ok).toBe(true);
+  });
+
+  it('refuses a vouched revision whose bytes were replaced, comparing against the recorded digest', async () => {
+    const root = await freshStore('get-replaced');
+    await put(root, signedX);
+    // Valid, signed, parseable: only the recorded digest can tell it is not what was put.
+    writeFileSync(join(root, 'bundles', ENTRY, '1.json'), `${JSON.stringify(signedY, null, 2)}\n`);
+    await expect(getBundle(root, ENTRY, 1, options)).rejects.toThrow(/stored revision 1 of .* does not verify[\s\S]*no longer hashes to its recorded digest/);
+    await expect(getBundle(root, ENTRY, undefined, options)).rejects.toThrow(/no longer hashes to its recorded digest/);
+    const lenient = await getBundle(root, ENTRY, 1, { ...options, strict: false });
+    expect(lenient.report.ok).toBe(false);
+    expect(lenient.report.problems.join('\n')).toMatch(/no longer hashes to its recorded digest/);
+    expect((await verifyStore(root, options)).problems.join('\n')).toMatch(/no longer hashes to its recorded digest/);
+  });
+});
+
 describe('getBundle without a revision', () => {
   it('returns the newest vouched revision, not the newest file', async () => {
     const root = await freshStore('newest-vouched');
@@ -587,7 +615,8 @@ describe('getBundle without a revision', () => {
     writeFileSync(join(root, 'bundles', ENTRY, '2.json'), readFileSync(join(root, 'bundles', ENTRY, '1.json')));
     const options = { now: FIXTURE_NOW, baseDir: BASE };
     expect((await getBundle(root, ENTRY, undefined, options)).revision).toBe(1);
-    expect((await getBundle(root, ENTRY, 2, options)).revision).toBe(2);
+    // Asking for it by number is not a way around the missing transition.
+    await expect(getBundle(root, ENTRY, 2, options)).rejects.toThrow(/nothing vouches/);
   });
 });
 
