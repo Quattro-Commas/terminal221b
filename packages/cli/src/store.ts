@@ -1204,6 +1204,20 @@ export async function getBundle(
   return { entry, revision: target, bundle, report };
 }
 
+/**
+ * The stderr lines `case store get` prints. With --no-verify a failing report
+ * is returned rather than thrown, so every problem is shown and the revision is
+ * not claimed to have been re-verified.
+ */
+export function readNoticeLines(got: Pick<GetResult, 'entry' | 'revision' | 'report'>): string[] {
+  const { entry, revision, report } = got;
+  if (report.problems.length === 0) return [`${entry} revision ${revision} re-verified on read`];
+  return [
+    ...report.problems.map((problem) => `problem: ${problem}`),
+    `${entry} revision ${revision} did NOT verify (${report.problems.length} problem(s)); the bytes below are unverified`,
+  ];
+}
+
 function isVouching(line: Transition, entry: string, revision: number): boolean {
   return line.action === 'put' && line.entry === entry && line.revision === revision && !!line.bundleDigest;
 }

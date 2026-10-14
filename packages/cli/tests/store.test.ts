@@ -20,6 +20,7 @@ import {
   putBundle,
   purgeExpired,
   readManifest,
+  readNoticeLines,
   saveRetentionPolicy,
   readPrivateKeyPem,
   readTransitions,
@@ -668,6 +669,33 @@ describe('reading a bundle back out', () => {
     await expect(
       getBundle(root, 'case-exact-in-scope', 7, { now: FIXTURE_NOW, baseDir: baseDir() })
     ).rejects.toThrow(/no revision 7.*it has 1/);
+  });
+});
+
+describe('what `case store get` tells the operator', () => {
+  const base = { entry: 'case-a', revision: 3 };
+  const report = (problems: string[]) => ({ ok: problems.length === 0, problems, entries: [], sources: [], signatures: [] });
+
+  it('keeps the existing line when the revision verifies', () => {
+    expect(readNoticeLines({ ...base, report: report([]) })).toEqual(['case-a revision 3 re-verified on read']);
+  });
+
+  it('prints every problem and does not claim re-verification when there are some', () => {
+    const lines = readNoticeLines({ ...base, report: report(['one', 'two']) });
+    expect(lines.slice(0, 2)).toEqual(['problem: one', 'problem: two']);
+    expect(lines.join('\n')).not.toMatch(/re-verified/);
+    expect(lines[2]).toMatch(/did NOT verify \(2 problem/);
+  });
+
+  it('is what getBundle with strict:false produces for a tampered revision', async () => {
+    const root = scratchRoot('notice-tampered');
+    await initStore(root, FIXTURE_NOW);
+    trustKey(root, { keyId: KEY_ID, publicKey }, FIXTURE_NOW);
+    await putBundle(root, signedFixture, { now: FIXTURE_NOW, baseDir: baseDir() });
+    const at = join(root, 'bundles', entryName(signedFixture), '1.json');
+    writeFileSync(at, `${readFileSync(at, 'utf8')} `);
+    const got = await getBundle(root, entryName(signedFixture), undefined, { now: FIXTURE_NOW, baseDir: baseDir(), strict: false });
+    expect(readNoticeLines(got).join('\n')).toMatch(/problem: .*no longer hashes/);
   });
 });
 
