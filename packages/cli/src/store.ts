@@ -197,6 +197,8 @@ export interface StorePaths {
   transitions: string;
   /** One log file per writer process; see recordTransition. */
   transitionsDir: string;
+  /** The pid lock version 1 CLIs took around every write. Never created by this version; only consulted before a migration. */
+  legacyLock: string;
 }
 
 /**
@@ -229,6 +231,7 @@ export function storePaths(root: string): StorePaths {
     keys: join(at, 'keys'),
     transitions: join(at, 'transitions.jsonl'),
     transitionsDir: join(at, 'transitions.d'),
+    legacyLock: join(at, '.lock'),
   };
 }
 
@@ -251,6 +254,13 @@ export async function initStore(root: string, now: string, context?: StoreContex
   const runtime = resolveContext(context);
   for (const dir of [paths.bundles, paths.objects, paths.keys, paths.transitionsDir]) {
     mkdirSync(dir, { recursive: true });
+  }
+  // A version 1 store is migrated (which checks for a live old writer before it
+  // fences anything), so the fence must not be laid down ahead of that check.
+  const existing = existsSync(paths.manifest) ? frozenKeysOfV1(paths) : undefined;
+  if (existing !== undefined) {
+    migrateStore(paths, existing, now, runtime);
+    return paths;
   }
   createExclusive(runtime, join(paths.bundles, FORMAT_FENCE), FENCE_BYTES);
   runtime.step('init:before-manifest');
@@ -424,6 +434,7 @@ function migrateStore(
   now: string,
   runtime: StoreRuntime
 ): void {
+  assertNoLiveV1Writer(paths, runtime);
   mkdirSync(paths.keys, { recursive: true });
   mkdirSync(paths.transitionsDir, { recursive: true });
   createExclusive(runtime, join(paths.bundles, FORMAT_FENCE), FENCE_BYTES);
@@ -434,6 +445,38 @@ function migrateStore(
     `${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: frozenKeys }, null, 2)}\n`
   );
   recordTransition(runtime, paths, { at: now, action: 'migrate', detail: 'store layout upgraded from version 1 to 2' });
+}
+
+/**
+ * A version 1 CLI serialises its writes with a pid lock and trusts it. Migrating
+ * underneath one that is mid-write would let it rename over a revision a
+ * lock-free writer has just claimed, so a live holder blocks the migration. A
+ * missing lock, one that is not a bare pid, or one whose process is gone is what
+ * the old CLI itself treats as free. EPERM means the process exists but belongs
+ * to someone else, which is alive. This narrows the window rather than closing
+ * it: an old CLI can still take the lock a moment after this check.
+ */
+function assertNoLiveV1Writer(paths: StorePaths, runtime: StoreRuntime): void {
+  let holder: string;
+  try {
+    holder = runtime.io.readFile(paths.legacyLock).toString('utf8').trim();
+  } catch (error) {
+    if (errnoCode(error) === 'ENOENT') return;
+    throw error;
+  }
+  if (!/^\d+$/.test(holder) || !isProcessAlive(Number(holder))) return;
+  throw new Error(
+    `an older terminal221b (pid ${holder}) is writing this store; let it finish or remove ${paths.legacyLock}`
+  );
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return errnoCode(error) === 'EPERM';
+  }
 }
 
 /** Skipped by every directory listing of bundles/; see migrateStore. */

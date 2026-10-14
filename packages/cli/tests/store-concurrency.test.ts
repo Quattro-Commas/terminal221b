@@ -15,6 +15,7 @@ import {
   closeSync,
   fsyncSync,
 } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FIXTURE_NOW, fixtureBundle as unsignedFixture } from '../src/case-fixtures.js';
@@ -680,7 +681,59 @@ describe('a version 1 store', () => {
     expect(readKeyDirectory(root).keys).toHaveLength(1);
     expect((await put(root, signedX)).revision).toBe(2);
   });
+
+  describe('with an old CLI holding the pid lock', () => {
+    const deadPid = (): number => {
+      const child = spawnSync(process.execPath, ['-e', '']);
+      return child.pid;
+    };
+    const untouched = (root: string) => {
+      expect(readManifest(root).version).toBe(1);
+      expect(existsSync(join(root, 'bundles', '.format-v2'))).toBe(false);
+    };
+
+    it('refuses to migrate while the lock holder is alive, naming the process and the lock file', async () => {
+      const { root } = v1Store();
+      writeFileSync(join(root, '.lock'), `${process.pid}\n`);
+      await expect(initStore(root, FIXTURE_NOW)).rejects.toThrow(
+        new RegExp(`an older terminal221b \\(pid ${process.pid}\\) is writing this store; let it finish or remove .*\\.lock`)
+      );
+      untouched(root);
+      await expect(put(root, signedX)).rejects.toThrow(/older terminal221b/);
+      expect(() => trustKey(root, { keyId: 'k2', publicKey: OTHER.publicKey }, FIXTURE_NOW)).toThrow(/older terminal221b/);
+      expect(revisionFiles(root)).toEqual(['1.json']);
+      untouched(root);
+    });
+
+    it('migrates when the lock names a dead process, or is not a pid', async () => {
+      const dead = v1Store().root;
+      writeFileSync(join(dead, '.lock'), `${deadPid()}\n`);
+      await initStore(dead, FIXTURE_NOW);
+      expect(readManifest(dead).version).toBe(2);
+
+      const junk = v1Store().root;
+      writeFileSync(join(junk, '.lock'), 'not-a-pid\n');
+      await initStore(junk, FIXTURE_NOW);
+      expect(readManifest(junk).version).toBe(2);
+    });
+
+    it('ignores a leftover lock once the store is version 2', async () => {
+      const { root } = v1Store();
+      await initStore(root, FIXTURE_NOW);
+      writeFileSync(join(root, '.lock'), `${process.pid}\n`);
+      expect((await put(root, signedX)).revision).toBe(2);
+    });
+
+    it('treats a live process we may not signal (EPERM) as alive', async () => {
+      if (process.getuid?.() === 0) return; // root can signal pid 1
+      const { root } = v1Store();
+      writeFileSync(join(root, '.lock'), '1\n');
+      await expect(initStore(root, FIXTURE_NOW)).rejects.toThrow(/older terminal221b \(pid 1\)/);
+    });
+  });
 });
+
+
 
 describe('no lock-free write reaches an unfenced store', () => {
   it('fences a fresh store at init', async () => {
