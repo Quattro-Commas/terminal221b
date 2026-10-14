@@ -22,6 +22,7 @@ import { FIXTURE_NOW, fixtureBundle as unsignedFixture } from '../src/case-fixtu
 import {
   getBundle,
   initStore,
+  keyFileName,
   listEntries,
   putBundle,
   purgeExpired,
@@ -351,6 +352,24 @@ describe('createExclusive', () => {
     const notBytes = { length: 1 } as unknown as Buffer;
     expect(() => nodeIO.openExcl(join(dir, 'a.json'), notBytes)).toThrow();
     expect(readdirSync(dir)).toEqual([]);
+  });
+});
+
+describe('a trusted key whose bytes are not a public key', () => {
+  it('is reported by verify and does not take the store offline', async () => {
+    const root = await freshStore('bad-key');
+    await put(root, signedX);
+    const broken = { keyId: 'broken', publicKeySpkiDerBase64: 'bm90IGEga2V5', addedAt: FIXTURE_NOW };
+    writeFileSync(join(root, 'keys', keyFileName('broken')), JSON.stringify(broken));
+
+    const report = await verifyStore(root, { now: FIXTURE_NOW, baseDir: BASE });
+    expect(report.ok).toBe(false);
+    expect(report.problems).toEqual([expect.stringMatching(/trusted key broken is not a usable public key/)]);
+    expect((await getBundle(root, ENTRY, undefined, { now: FIXTURE_NOW, baseDir: BASE })).revision).toBe(1);
+    expect((await put(root, signedY)).revision).toBe(2);
+
+    const bySkipped = signBundle(unsignedFixture, privateKey, 'broken', FIXTURE_NOW);
+    await expect(put(root, bySkipped)).rejects.toThrow(/unknown-key/);
   });
 });
 

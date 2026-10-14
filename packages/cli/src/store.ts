@@ -530,11 +530,22 @@ function isProcessAlive(pid: number): boolean {
 const FORMAT_FENCE = '.format-v2';
 const FENCE_BYTES = Buffer.from('terminal221b case store format 2\n');
 
+/**
+ * Verifier objects for every usable trusted key. A key whose bytes do not parse
+ * is left out and reported (see verifyStore) rather than thrown, so one damaged
+ * key record cannot take get, put and verify offline; a signature by that keyId
+ * then fails as an unknown key.
+ */
 function trustedKeyObjects(manifest: StoreManifest): Map<string, KeyObject> {
-  const out = new Map<string, KeyObject>();
+  return buildKeyObjects(manifest).keys;
+}
+
+function buildKeyObjects(manifest: StoreManifest): { keys: Map<string, KeyObject>; problems: string[] } {
+  const keys = new Map<string, KeyObject>();
+  const problems: string[] = [];
   for (const entry of manifest.trustedKeys) {
     try {
-      out.set(
+      keys.set(
         entry.keyId,
         createPublicKey({
           key: Buffer.from(entry.publicKeySpkiDerBase64, 'base64'),
@@ -543,10 +554,10 @@ function trustedKeyObjects(manifest: StoreManifest): Map<string, KeyObject> {
         })
       );
     } catch {
-      throw new Error(`trusted key ${entry.keyId} in the store manifest is not a usable public key`);
+      problems.push(`trusted key ${entry.keyId} is not a usable public key; signatures by it cannot be verified`);
     }
   }
-  return out;
+  return { keys, problems };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1306,8 +1317,8 @@ export async function verifyStore(
 ): Promise<VerifyReport> {
   const paths = storePaths(root);
   const manifest = readManifest(root);
-  const keys = trustedKeyObjects(manifest);
-  const problems: string[] = [];
+  const { keys, problems: keyProblems } = buildKeyObjects(manifest);
+  const problems: string[] = [...keyProblems];
   const allSources: SourceVerification[] = [];
   const allSignatures: SignatureReport[] = [];
   const runtime = resolveContext();

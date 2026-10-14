@@ -3,7 +3,7 @@ import { generateKeyPairSync, createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseCaseBundle } from '../src/case.js';
+import { parseCaseBundle, type ConfirmationRecord } from '../src/case.js';
 import { FIXTURE_NOW, fixtureBundle as unsignedFixture } from '../src/case-fixtures.js';
 import {
   ATTESTED_KINDS,
@@ -472,17 +472,20 @@ describe('trusting a key', () => {
     );
   });
 
-  it('rejects a manifest entry that is not a usable public key', async () => {
+  it('skips a manifest entry that is not a usable public key, so a signature by it fails closed', async () => {
     const root = scratchRoot('trust-broken');
     await initStore(root, FIXTURE_NOW);
     writeFileSync(
       join(root, 'manifest.json'),
       JSON.stringify({
         version: 1,
-        trustedKeys: [{ keyId: 'bad', publicKeySpkiDerBase64: 'bm90LWEtkeyk=', addedAt: FIXTURE_NOW }],
+        trustedKeys: [{ keyId: KEY_ID, publicKeySpkiDerBase64: 'bm90LWEtkeyk=', addedAt: FIXTURE_NOW }],
       })
     );
-    expect(() => confirmationSignatureChecker(readManifest(root))).toThrow(/not a usable public key/);
+    const confirmation = recordsOfKind(signedFixture, 'confirmation')[0] as ConfirmationRecord;
+    const checker = confirmationSignatureChecker(readManifest(root));
+    expect(confirmationSignatureChecker(trusted)(confirmation)).toBe(true);
+    expect(checker(confirmation)).toBe(false);
   });
 
   it('refuses a private key file presented where a signing key is expected', () => {
