@@ -47,7 +47,14 @@ import {
   RETENTION_CLASSES,
   validateCaseBundle,
 } from './case.js';
-import { resolveContext, writeDurable as writeDurableWith } from './store-io.js';
+import {
+  createExclusive,
+  errnoCode,
+  resolveContext,
+  writeDurable as writeDurableWith,
+  type StoreContext,
+  type StoreRuntime,
+} from './store-io.js';
 
 const SCHEMA_VERSION = 1;
 /** Bumping this changes what a signature commits to, so old signatures stop verifying. */
@@ -634,11 +641,16 @@ export function entryName(bundle: CaseBundle, explicit?: string): string {
   return name;
 }
 
-function listRevisions(paths: StorePaths, entry: string): number[] {
-  const dir = join(paths.bundles, entry);
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir)
-    .filter((name) => name.endsWith('.json'))
+function listRevisions(runtime: StoreRuntime, paths: StorePaths, entry: string): number[] {
+  let names: string[];
+  try {
+    names = runtime.io.readdir(join(paths.bundles, entry));
+  } catch (error) {
+    if (errnoCode(error) === 'ENOENT') return [];
+    throw error;
+  }
+  return names
+    .filter((name) => !name.startsWith('.') && name.endsWith('.json'))
     .map((name) => Number(name.replace(/\.json$/, '')))
     .filter((n) => Number.isInteger(n) && n > 0)
     .sort((a, b) => a - b);
@@ -654,6 +666,64 @@ export interface PutOptions extends SourceCheckOptions {
   entry?: string;
   /** When false, unsigned human records are accepted but reported. Default: refuse. */
   allowUnsigned?: boolean;
+  /** Test seam: filesystem, step hooks and writer identity. Production passes nothing. */
+  context?: StoreContext;
+}
+
+const MAX_CLAIM_ATTEMPTS = 20;
+const BACKOFF_MIN_MS = 1;
+const BACKOFF_MAX_MS = 25;
+
+function objectPathFor(paths: StorePaths, bundleDigest: string): string {
+  return join(paths.objects, bundleDigest.replace(':', '-'));
+}
+
+/**
+ * Makes sure the content-addressed object for `bundleDigest` exists and hashes
+ * to it. The name is derived from the bytes, so an existing object with the
+ * right digest IS this object and losing the create race is success. One with
+ * the wrong digest is corrupt, and is replaced by temp+rename: the name is
+ * already taken, so claiming it is no longer the question.
+ */
+function ensureObject(runtime: StoreRuntime, paths: StorePaths, bundleDigest: string, bytes: Buffer): void {
+  const path = objectPathFor(paths, bundleDigest);
+  mkdirSync(paths.objects, { recursive: true });
+  if (createExclusive(runtime, path, bytes)) return;
+  let existing: Buffer | undefined;
+  try {
+    existing = runtime.io.readFile(path);
+  } catch (error) {
+    // Condemned by a concurrent purge between our create and our read.
+    if (errnoCode(error) !== 'ENOENT') throw error;
+  }
+  if (existing !== undefined && sha256(existing) === bundleDigest) return;
+  writeDurableWith(runtime, path, bytes);
+}
+
+/**
+ * Claims the next revision number by creating `<n>.json` exclusively. Two
+ * writers that computed the same n cannot both win; the loser re-lists, which
+ * now shows the winner's file, and takes n+1. Numbers are never reused because
+ * the only thing that ever removes a revision file is a purge, and a purge never
+ * removes the newest one.
+ */
+async function claimRevision(
+  runtime: StoreRuntime,
+  paths: StorePaths,
+  entry: string,
+  bytes: Buffer
+): Promise<number> {
+  mkdirSync(join(paths.bundles, entry), { recursive: true });
+  for (let attempt = 1; attempt <= MAX_CLAIM_ATTEMPTS; attempt += 1) {
+    const revision = (listRevisions(runtime, paths, entry).at(-1) ?? 0) + 1;
+    await runtime.step('put:before-claim');
+    if (createExclusive(runtime, bundlePathFor(paths, entry, revision), bytes)) return revision;
+    const jitter = BACKOFF_MIN_MS + Math.floor(Math.random() * (BACKOFF_MAX_MS - BACKOFF_MIN_MS + 1));
+    await runtime.sleep(jitter);
+  }
+  throw new Error(
+    `too much contention on ${entry}: could not claim a revision after ${MAX_CLAIM_ATTEMPTS} attempts; try again`
+  );
 }
 
 /**
@@ -692,20 +762,26 @@ export async function putBundle(root: string, bundle: CaseBundle, options: PutOp
   const serialized = `${JSON.stringify(bundle, null, 2)}\n`;
   const bundleDigest = sha256(serialized);
 
-  return withStoreLock(paths, () => {
-    const revision = (listRevisions(paths, entry).at(-1) ?? 0) + 1;
-    writeDurableWith(resolveContext(), bundlePathFor(paths, entry, revision), serialized);
-    writeDurableWith(resolveContext(), join(paths.objects, bundleDigest.replace(':', '-')), serialized);
-    recordTransition(paths, {
-      at: options.now,
-      action: 'put',
-      entry,
-      revision,
-      bundleDigest,
-      detail: `${signatures.filter((entry) => entry.status === 'signed').length} signed human records`,
-    });
-    return { entry, revision, bundleDigest, storedAt: options.now, sources };
+  const runtime = resolveContext(options.context);
+  const bytes = Buffer.from(serialized, 'utf8');
+  ensureObject(runtime, paths, bundleDigest, bytes);
+  await runtime.step('put:object-written');
+  const revision = await claimRevision(runtime, paths, entry, bytes);
+  await runtime.step('put:claimed');
+  recordTransition(paths, {
+    at: options.now,
+    action: 'put',
+    entry,
+    revision,
+    bundleDigest,
+    detail: `${signatures.filter((entry) => entry.status === 'signed').length} signed human records`,
   });
+  await runtime.step('put:after-append');
+  // A purge may have condemned the object between our write and our append,
+  // judging it unreferenced because our transition did not exist yet. Now that
+  // the transition does, put the object back if it is gone.
+  ensureObject(runtime, paths, bundleDigest, bytes);
+  return { entry, revision, bundleDigest, storedAt: options.now, sources };
 }
 
 export interface GetOptions extends SourceCheckOptions {
@@ -729,7 +805,7 @@ export async function getBundle(
   options: GetOptions
 ): Promise<GetResult> {
   const paths = storePaths(root);
-  const revisions = listRevisions(paths, entry);
+  const revisions = listRevisions(resolveContext(), paths, entry);
   if (revisions.length === 0) {
     throw new Error(`the store holds no revisions of ${entry}`);
   }
@@ -764,7 +840,7 @@ export function listEntries(root: string): StoreEntry[] {
   for (const name of readdirSync(paths.bundles).sort()) {
     const dir = join(paths.bundles, name);
     if (!existsSync(dir)) continue;
-    for (const revision of listRevisions(paths, name)) {
+    for (const revision of listRevisions(resolveContext(), paths, name)) {
       const recorded = transitions.find(
         (line) => line.entry === name && line.revision === revision && line.bundleDigest
       );
