@@ -21,6 +21,7 @@ import {
   createHash,
   createPrivateKey,
   createPublicKey,
+  randomBytes,
   sign as cryptoSign,
   verify as cryptoVerify,
   KeyObject,
@@ -31,12 +32,14 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
   writeSync,
 } from 'node:fs';
@@ -252,34 +255,151 @@ function basenameOf(path: string): string {
 }
 
 /**
- * A cooperative lock: advisory, taken by writing our pid, released by removing
- * it. Two concurrent `put`s in the same store would otherwise both compute the
- * next revision from the same on-disk state and one would overwrite the other.
+ * A cooperative, advisory lock on one store. Two concurrent `put`s would otherwise
+ * both compute the next revision from the same on-disk state and one would
+ * overwrite the other.
+ *
+ * How it stays exclusive:
+ *  - The lock appears complete in one step: a temp file holding `pid:random-token`
+ *    is hard-linked to the lock path, which either creates it with our token
+ *    already inside or fails with EEXIST. (Creating the file and writing the pid
+ *    afterwards let another process read an empty lock and take it over as stale
+ *    while its holder was alive.) Where hard links are not supported (FAT, exFAT,
+ *    some network or FUSE mounts) it falls back to an exclusive create; an empty or
+ *    partial lock younger than LOCK_WRITE_GRACE_MS counts as one being written.
+ *  - A stale lock is broken by one process at a time: the breaker takes
+ *    `<lock>.break` exclusively, re-reads the lock, and removes it only if it still
+ *    holds the very token judged stale. Nobody else removes a lock but its owner.
+ *  - Release removes the lock only if it still holds our own token.
+ *  - A holder we may not signal (EPERM: another user's process) counts as alive.
+ *
+ * Left over, documented: a pid reused after a crash keeps an old lock "alive"; the
+ * error names the lock file so it can be removed by hand. Two breakers can only
+ * overlap if a crashed breaker left a break file older than BREAK_STALE_MS.
  */
 export function withStoreLock<T>(paths: StorePaths, body: () => T): T {
   mkdirSync(paths.root, { recursive: true });
-  if (existsSync(paths.lock)) {
-    const holder = readFileSync(paths.lock, 'utf8').trim();
-    const alive = /^\d+$/.test(holder) && isProcessAlive(Number(holder));
-    if (alive) {
-      throw new Error(`the case store is locked by process ${holder}`);
-    }
-    rmSync(paths.lock, { force: true });
-  }
-  writeFileSync(paths.lock, `${process.pid}\n`);
+  const token = takeLock(paths.lock);
   try {
     return body();
   } finally {
-    rmSync(paths.lock, { force: true });
+    releaseLock(paths.lock, token);
   }
+}
+
+const LOCK_ATTEMPTS = 3;
+const LOCK_WRITE_GRACE_MS = 10_000;
+const BREAK_STALE_MS = 30_000;
+const NO_HARD_LINKS = new Set(['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS', 'EXDEV']);
+
+function errorCode(error: unknown): string {
+  return (error as NodeJS.ErrnoException).code ?? '';
+}
+
+function takeLock(lock: string): string {
+  const token = `${process.pid}:${randomBytes(8).toString('hex')}`;
+  for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt += 1) {
+    if (createLock(lock, token)) return token;
+    const holder = readLockHolder(lock);
+    if (holder === undefined) continue; // released meanwhile: try again
+    if (holderIsAlive(lock, holder)) {
+      throw new Error(
+        `the case store is locked by process ${holder.split(':')[0] || '(unknown)'}; ` +
+          `if no terminal221b process is running, remove ${lock}`
+      );
+    }
+    breakStaleLock(lock, holder);
+  }
+  throw new Error(`the case store lock at ${lock} kept changing hands; try again`);
+}
+
+/** Creates the lock with our token already in it, or returns false if one exists. */
+function createLock(lock: string, token: string): boolean {
+  const temp = `${lock}.${token.replace(':', '-')}.tmp`;
+  try {
+    writeFileSync(temp, `${token}\n`, { flag: 'wx' });
+  } catch (error) {
+    rmSync(temp, { force: true }); // created but not written (ENOSPC, EIO)
+    throw error;
+  }
+  try {
+    linkSync(temp, lock);
+    return true;
+  } catch (error) {
+    if (errorCode(error) === 'EEXIST') return false;
+    if (!NO_HARD_LINKS.has(errorCode(error))) throw error;
+    try {
+      writeFileSync(lock, `${token}\n`, { flag: 'wx' });
+      return true;
+    } catch (fallbackError) {
+      if (errorCode(fallbackError) === 'EEXIST') return false;
+      throw fallbackError;
+    }
+  } finally {
+    rmSync(temp, { force: true });
+  }
+}
+
+function readLockHolder(lock: string): string | undefined {
+  try {
+    return readFileSync(lock, 'utf8').trim();
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+function ageMs(path: string): number | undefined {
+  try {
+    return Date.now() - statSync(path).mtimeMs;
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+function holderIsAlive(lock: string, holder: string): boolean {
+  const pid = /^(\d+)(?::[0-9a-f]+)?$/.exec(holder)?.[1];
+  if (pid === undefined) {
+    // Empty or partial: still being written (young) or left by a crash (old).
+    const age = ageMs(lock);
+    return age !== undefined && age < LOCK_WRITE_GRACE_MS;
+  }
+  return isProcessAlive(Number(pid));
+}
+
+function breakStaleLock(lock: string, staleHolder: string): void {
+  const breaker = `${lock}.break`;
+  try {
+    writeFileSync(breaker, `${process.pid}\n`, { flag: 'wx' });
+  } catch (error) {
+    if (errorCode(error) !== 'EEXIST') throw error;
+    // Someone else is breaking it, which takes microseconds; one this old is a crash.
+    const age = ageMs(breaker);
+    if (age !== undefined && age > BREAK_STALE_MS) rmSync(breaker, { force: true });
+    return;
+  }
+  try {
+    if (readLockHolder(lock) === staleHolder && !holderIsAlive(lock, staleHolder)) {
+      rmSync(lock, { force: true });
+    }
+  } finally {
+    rmSync(breaker, { force: true });
+  }
+}
+
+function releaseLock(lock: string, token: string): void {
+  // Our lock cannot be broken while we are alive, so this read-then-remove is safe;
+  // the check stops us removing a lock that is not ours.
+  if (readLockHolder(lock) === token) rmSync(lock, { force: true });
 }
 
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return errorCode(error) === 'EPERM'; // exists, but belongs to another user
   }
 }
 
@@ -291,11 +411,16 @@ export async function initStore(root: string, now: string): Promise<StorePaths> 
   const paths = storePaths(root);
   mkdirSync(paths.bundles, { recursive: true });
   mkdirSync(paths.objects, { recursive: true });
-  if (!existsSync(paths.transitions)) writeFileSync(paths.transitions, '');
-  if (!existsSync(paths.manifest)) {
-    writeDurable(paths.manifest, `${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: [] }, null, 2)}\n`);
-    recordTransition(paths, { at: now, action: 'init', detail: `store initialised at ${paths.root}` });
-  }
+  // Append mode creates the file if it is missing and never truncates it.
+  writeFileSync(paths.transitions, '', { flag: 'a' });
+  // Under the lock, so two concurrent inits cannot both write a fresh manifest (the
+  // second would reset trustedKeys) or both record 'init'.
+  withStoreLock(paths, () => {
+    if (!existsSync(paths.manifest)) {
+      writeDurable(paths.manifest, `${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: [] }, null, 2)}\n`);
+      recordTransition(paths, { at: now, action: 'init', detail: `store initialised at ${paths.root}` });
+    }
+  });
   return paths;
 }
 
@@ -323,10 +448,7 @@ export function trustKey(
   now: string
 ): TrustedKey {
   const paths = storePaths(root);
-  const manifest = readManifest(root);
-  if (manifest.trustedKeys.some((entry) => entry.keyId === key.keyId)) {
-    throw new Error(`keyId ${key.keyId} is already trusted; choose another keyId or remove the entry first`);
-  }
+  readManifest(root); // fail early, before the lock, if there is no store
   const parsedKey = Buffer.isBuffer(key.publicKey)
     ? createPublicKey({ key: key.publicKey, format: 'der', type: 'spki' })
     : key.publicKey;
@@ -340,8 +462,14 @@ export function trustKey(
     ...(key.label === undefined ? {} : { label: key.label }),
     addedAt: now,
   };
-  const next: StoreManifest = { version: SCHEMA_VERSION, trustedKeys: [...manifest.trustedKeys, entry] };
   withStoreLock(paths, () => {
+    // Read and check under the lock: read outside it, two concurrent trusts each
+    // wrote their own key onto the same old list and one key was lost.
+    const manifest = readManifest(root);
+    if (manifest.trustedKeys.some((existing) => existing.keyId === key.keyId)) {
+      throw new Error(`keyId ${key.keyId} is already trusted; choose another keyId or remove the entry first`);
+    }
+    const next: StoreManifest = { version: SCHEMA_VERSION, trustedKeys: [...manifest.trustedKeys, entry] };
     writeDurable(paths.manifest, `${JSON.stringify(next, null, 2)}\n`);
     recordTransition(paths, { at: now, action: 'trust', detail: `trusted key ${key.keyId}` });
   });

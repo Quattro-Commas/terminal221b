@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { generateKeyPairSync, createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, statSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseCaseBundle } from '../src/case.js';
@@ -14,6 +14,8 @@ import {
   entryName,
   getBundle,
   initStore,
+  storePaths,
+  withStoreLock,
   loadRetentionPolicy,
   localPathFor,
   payloadDigestOf,
@@ -1122,5 +1124,89 @@ describe('the retention policy is a file the operator edits, not a code default'
 
   it('ships a starting policy that is a position, not a measurement', () => {
     expect(DEFAULT_RETENTION_POLICY).toEqual({ transient: 7, case_metadata: 180, local_diff: 180 });
+  });
+});
+
+describe('the store lock', () => {
+  const TOKEN = new RegExp(`^${process.pid}:[0-9a-f]{16}\\n$`);
+  const lockedRoot = (label: string) => {
+    const paths = storePaths(scratchRoot(label));
+    mkdirSync(paths.root, { recursive: true });
+    return paths;
+  };
+  const age = (path: string, seconds: number) => {
+    const then = new Date(Date.now() - seconds * 1000);
+    utimesSync(path, then, then);
+  };
+
+  it('is held with our token, refuses a second taker, and is released afterwards', () => {
+    const paths = lockedRoot('lock-held');
+    withStoreLock(paths, () => {
+      expect(readFileSync(paths.lock, 'utf8')).toMatch(TOKEN);
+      expect(() => withStoreLock(paths, () => 'second')).toThrow(/locked by process/);
+    });
+    expect(existsSync(paths.lock)).toBe(false);
+    expect(withStoreLock(paths, () => 'after')).toBe('after');
+  });
+
+  it('never breaks a live holder, in either lock format', () => {
+    const paths = lockedRoot('lock-live');
+    for (const holder of [`${process.pid}\n`, `${process.pid}:abcdef0123456789\n`]) {
+      writeFileSync(paths.lock, holder);
+      age(paths.lock, 3600);
+      expect(() => withStoreLock(paths, () => 'x')).toThrow(/locked by process/);
+      expect(readFileSync(paths.lock, 'utf8')).toBe(holder);
+    }
+  });
+
+  it('treats a holder it may not signal (EPERM) as alive', () => {
+    if (process.getuid?.() === 0 || process.platform === 'win32') return; // root may signal pid 1
+    const paths = lockedRoot('lock-eperm');
+    writeFileSync(paths.lock, '1\n'); // init: alive, owned by root
+    expect(() => withStoreLock(paths, () => 'x')).toThrow(/locked by process 1/);
+  });
+
+  it('takes over a lock whose holder is gone', () => {
+    const paths = lockedRoot('lock-stale');
+    for (const holder of ['999999999\n', '999999999:abcdef0123456789\n', 'not a pid\n']) {
+      writeFileSync(paths.lock, holder);
+      age(paths.lock, 3600);
+      expect(withStoreLock(paths, () => readFileSync(paths.lock, 'utf8'))).toMatch(TOKEN);
+      expect(existsSync(paths.lock)).toBe(false);
+    }
+  });
+
+  it('respects an empty lock that is still being written, and takes one left by a crash', () => {
+    const paths = lockedRoot('lock-empty');
+    writeFileSync(paths.lock, '');
+    expect(() => withStoreLock(paths, () => 'x')).toThrow(/locked by process/);
+    age(paths.lock, 60);
+    expect(withStoreLock(paths, () => 'taken')).toBe('taken');
+  });
+
+  it('never removes a lock it does not own on release', () => {
+    const paths = lockedRoot('lock-release');
+    const other = '999999998:00000000000000aa\n';
+    withStoreLock(paths, () => {
+      writeFileSync(paths.lock, other); // someone else's lock now sits at the path
+    });
+    expect(readFileSync(paths.lock, 'utf8')).toBe(other);
+  });
+
+  it('lets only one process break a stale lock, and clears a break file left by a crash', () => {
+    const paths = lockedRoot('lock-break');
+    writeFileSync(paths.lock, '999999999\n');
+    writeFileSync(`${paths.lock}.break`, '999999997\n'); // a breaker at work
+    expect(() => withStoreLock(paths, () => 'x')).toThrow(/kept changing hands/);
+    age(`${paths.lock}.break`, 120); // ...that crashed long ago
+    expect(withStoreLock(paths, () => 'broken')).toBe('broken');
+  });
+
+  it('leaves no temp or break files behind', () => {
+    const paths = lockedRoot('lock-clean');
+    writeFileSync(paths.lock, '999999999\n');
+    withStoreLock(paths, () => undefined);
+    withStoreLock(paths, () => undefined);
+    expect(readdirSync(paths.root).filter((name) => /\.(tmp|break)$/.test(name))).toEqual([]);
   });
 });
