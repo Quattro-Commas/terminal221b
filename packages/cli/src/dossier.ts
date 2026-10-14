@@ -42,8 +42,10 @@ function safe(value: string): string {
   return value.replace(LINE_BREAKS, ' ').replace(CONTROL_CHARACTERS, '\ufffd');
 }
 
-function safeCell(value: string): string {
-  return safe(value).replace(/\|/g, '\\|');
+/** A markdown table cell: backslashes escaped first, so text ending in one cannot
+ * un-escape the pipe that follows and split the cell. */
+export function safeCell(value: string): string {
+  return safe(value).replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
 }
 
 /**
