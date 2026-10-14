@@ -30,12 +30,16 @@ Three properties it has, and one it does not.
 
 ```
 <store root>/
-  manifest.json           trusted keys, nothing else
-  transitions.jsonl       append-only: init, trust, put
+  manifest.json             format version and a frozen base list of trusted keys
+  keys/<sha256(keyId)>.json one file per trusted key, created exclusively
+  transitions.d/*.jsonl     append-only, one log per writer process: init, trust, put, purge
+  transitions.jsonl         legacy shared log from older stores; read if present, never written
   bundles/<entry>/<n>.json  one file per revision
+  bundles/.format-v2        a regular file that makes older CLIs fail loudly
   objects/<sha256-hex>      content-addressed copy of each stored bundle
-  .lock                     held for the duration of a write
 ```
+
+There is no lock. Writers claim names with an exclusive create and retry on a collision; see `docs/adr/0001-lock-free-case-store.md`. Temp files (`.*.tmp-*`) and condemned objects (`objects/.condemned-*`) are ignored by readers and listed by `verify` if an interrupted write left them.
 
 The store root comes from `--store`, else `$XDG_DATA_HOME/terminal221b`, else `~/.local/share/terminal221b`. It is deliberately **outside any repository**: `case store init` says so on every run, because a store inside a git tree is a store whose attestations and operator key ids end up in a commit.
 
@@ -47,7 +51,7 @@ The store root comes from `--store`, else `$XDG_DATA_HOME/terminal221b`, else `~
 
 `case sign` reads an operator-supplied ed25519 PKCS#8 PEM, signs in memory, and writes the signed JSON to stdout. **The private key is never copied, logged, or written into the bundle or the store.** `store.test.ts` walks every byte under a populated store root and asserts that none of them contains a line of the private key; the end-to-end script repeats the check with `grep -r "PRIVATE KEY"` over the store.
 
-The store holds the public half only, as `publicKeySpkiDerBase64` in `manifest.json`:
+The store holds the public half only, as `publicKeySpkiDerBase64` in `keys/<sha256(keyId)>.json` (and in the manifest's frozen list for stores created before keys/ existed):
 
 ```json
 {
@@ -95,7 +99,7 @@ Four consequences, each with a test:
 2. Signatures — every human record is `signed` under a trusted key. A refusal names every offending record and points at `case sign`.
 3. Source digests — every reachable local source's bytes hash to its declared `contentDigest`. A refusal names the source, the URI, and **both** digests.
 
-Then, under the lock: the bundle is serialised, its digest recorded in `transitions.jsonl`, the revision written to `bundles/<entry>/<n>.json`, and a copy written to `objects/<sha256>`.
+Then, with no lock: the bundle is serialised, a copy written to `objects/<sha256>`, the next revision claimed exclusively as `bundles/<entry>/<n>.json` (a collision re-lists and takes the next number), its digest recorded in this process's `transitions.d/` log, and the object re-checked. A read without `--revision` returns the newest revision a transition vouches for.
 
 `getBundle` re-runs all of it on the way out. `verifyStore` re-runs it across every revision in the store and additionally compares each file's bytes against the digest recorded at write time — never against a digest recomputed from those same bytes, which is F19 and the reason a green suite did not catch it.
 
@@ -197,5 +201,5 @@ Age is measured from `observedAt`, which **you** record. It describes your recor
 - Only the two `local://` policy snapshots in the fixture are actually hashed. The other three sources are unreachable here and are reported as such rather than counted as verified (F16).
 - The store can delete a **revision**, not the stale content inside a live one (F21). Retention within the newest revision needs a re-signed revision.
 - The retention **windows are yours**, not the tool's. `DEFAULT_RETENTION_POLICY` is the answer to open decision 3 (7 / 180 / 180 days, archive never) and it reaches the store only through a `retention.json` you record. Until that file exists every class reports `unconfigured` and nothing is purgeable.
-- The store is single-process-local. The lock is a pid file; there is no cross-machine store, no server, and no multi-user story.
+- The store is a directory, not a service. It tolerates concurrent writers on one host and is laid out so several hosts can share it, but there is no server and no multi-user story. On NFS, purge's object re-check can read stale directory attributes, so its guarantee that an object in use survives is weaker there.
 - A task run acts on a contract now (F17 closed for the write path), but the actor is a single contract an operator hands the executor by hand. There is no scheduler, no queue, and no orchestration: `role` is still a label on a contract, and nothing reads it to decide who runs.

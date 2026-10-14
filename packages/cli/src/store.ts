@@ -1,7 +1,7 @@
 /**
  * The local case store: a directory on this machine that holds accepted case
- * bundles, the public keys their operator signatures are checked against, and an
- * append-only transition log.
+ * bundles, the public keys their operator signatures are checked against, and
+ * the transition logs that vouch for what was written.
  *
  * Three rules the store exists to enforce, and the reason each one cannot live
  * in the schema layer:
@@ -11,11 +11,26 @@
  *    hashing the actual file turns it into a check.
  * 2. A record that asserts a human decided something carries a detached
  *    signature, and the store refuses to accept an unsigned one (F4). The
- *    public keys live in the manifest; the private key never enters a bundle
- *    and is never written here.
+ *    public keys live in `keys/` (one file each) plus the manifest's frozen
+ *    base list; the private key never enters a bundle and is never written here.
  * 3. Remote sources are never fetched. An `https://` source is recorded as
  *    unverifiable-here and left alone, because a store whose integrity check
  *    performs network egress is not a local store.
+ *
+ * Concurrency: there is no lock. Writers claim names with an exclusive create
+ * (`createExclusive`: write a temp file, hard-link it to the final name, so a
+ * loser gets EEXIST instead of replacing). `put` claims `<n>.json` and retries
+ * with jitter on a collision; a trust or init is one exclusive file; each
+ * writer process appends only to its own `transitions.d/` log, so no two
+ * writers share a file and the layout holds across hosts. Because a revision
+ * file can exist a moment before its transition does, a read without an
+ * explicit revision returns the newest *vouched* revision, and `verify` may
+ * report an in-flight write as unvouched; there is deliberately no time-based
+ * grace. A purge condemns an object by renaming it aside and re-checks for
+ * references before deleting; together with `put`'s post-append object check an
+ * object in use is not lost on a local filesystem. Over NFS that re-check can
+ * read stale directory attributes, so the guarantee is weaker there. See
+ * docs/adr/0001-lock-free-case-store.md.
  */
 import {
   createHash,
