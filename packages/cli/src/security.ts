@@ -138,9 +138,10 @@ export async function scanLocalWorkspace(workspacePath: string): Promise<LocalSc
 
       const read = await readBoundedFile(absolutePath, Math.min(maxFileBytes, maxTotalBytes - bytesScanned), root);
       if (read.kind === 'skipped') {
-        // Anything but a symlink or a non-file means a candidate went unscanned: say so,
-        // rather than letting truncated=false read as "every file was checked".
-        if (read.reason !== 'symlink' && read.reason !== 'not-a-regular-file') truncated = true;
+        // The walker already dropped symlinks and non-files, so any skip here is a
+        // candidate that went unscanned (a race): say so, rather than letting
+        // truncated=false read as "every file was checked".
+        truncated = true;
         continue;
       }
       const content = read.content;
