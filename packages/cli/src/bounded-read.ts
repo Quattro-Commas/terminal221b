@@ -11,6 +11,7 @@ export type BoundedRead =
 
 // What open(O_NOFOLLOW) reports for a symlink: ELOOP on Linux and macOS, EMLINK on
 // FreeBSD, EFTYPE on NetBSD.
+// ELOOP also means a looping parent directory; that case is told apart below.
 const SYMLINK_OPEN_ERRORS = new Set(['ELOOP', 'EMLINK', 'EFTYPE']);
 
 // Same rule as the scanners' isWithinRoot ("..foo" is a name, not a parent), plus
@@ -24,15 +25,15 @@ function within(root: string, candidate: string): boolean {
 // handle holds, so no later swap of a parent directory can change the answer. Other
 // platforms resolve the path again and compare inodes: a narrower check that a
 // precisely timed second swap could still pass.
-async function openedPath(path: string, fd: number): Promise<string> {
+async function openedPath(path: string, fd: number): Promise<{ real: string; viaHandle: boolean }> {
   if (process.platform === 'linux') {
     try {
-      return await readlink(`/proc/self/fd/${fd}`);
+      return { real: await readlink(`/proc/self/fd/${fd}`), viaHandle: true };
     } catch {
       // /proc not mounted: fall through to the portable check
     }
   }
-  return realpath(path);
+  return { real: await realpath(path), viaHandle: false };
 }
 
 /**
@@ -54,18 +55,37 @@ async function openedPath(path: string, fd: number): Promise<string> {
  *  - at most `min(size, maxBytes) + 1` bytes read, so growth after the check is
  *    caught rather than returned as a truncated file.
  *
- * Errors other than "this is a symlink" are raised, as `readFile` raised them.
+ * Errors other than the skips above are raised, as `readFile` raised them.
+ *
+ * Not covered: the directory walk itself (readdir/visit on a directory swapped for a
+ * symlink after it was listed). Only the file read is guarded here; directory
+ * traversal is a separate follow-up.
  */
 export async function readBoundedFile(path: string, maxBytes: number, root: string): Promise<BoundedRead> {
+  // Nothing can fit: do not open, fstat or readlink a file only to refuse it.
+  if (maxBytes < 1) return { kind: 'skipped', reason: 'too-large' };
   let handle;
   try {
     handle = await open(
       path,
-      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)
+      constants.O_RDONLY |
+        (constants.O_NOFOLLOW ?? 0) |
+        (constants.O_NONBLOCK ?? 0) |
+        (constants.O_NOCTTY ?? 0) // a swapped-in tty must never become our controlling terminal
     );
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code ?? '';
-    if (SYMLINK_OPEN_ERRORS.has(code)) return { kind: 'skipped', reason: 'symlink' };
+    if (SYMLINK_OPEN_ERRORS.has(code)) {
+      // Only a symlinked final component is a plain 'symlink'. Anything else (a
+      // looping parent) is a candidate that went unread: 'changed', which the
+      // scanners report as truncated, never silent.
+      const isLink = await lstat(path).then((s) => s.isSymbolicLink(), () => false);
+      return { kind: 'skipped', reason: isLink ? 'symlink' : 'changed' };
+    }
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      // Deleted, or a parent replaced, between the directory listing and the open.
+      return { kind: 'skipped', reason: 'changed' };
+    }
     if (code === 'EISDIR' || code === 'ENXIO' || code === 'ENODEV') {
       return { kind: 'skipped', reason: 'not-a-regular-file' }; // directory, socket, device
     }
@@ -84,11 +104,16 @@ export async function readBoundedFile(path: string, maxBytes: number, root: stri
     if (opened.size > maxBytes) return { kind: 'skipped', reason: 'too-large' };
 
     try {
-      const real = await openedPath(path, handle.fd);
+      const { real, viaHandle } = await openedPath(path, handle.fd);
       if (!within(root, real)) return { kind: 'skipped', reason: 'outside-root' };
-      const atReal = await stat(real);
-      if (atReal.dev !== opened.dev || atReal.ino !== opened.ino) {
-        return { kind: 'skipped', reason: 'changed' };
+      // /proc names the file the handle holds, so a comparison adds nothing there (and
+      // would turn a benign rename after the open into 'changed'). Only the path
+      // re-resolution fallback needs the dev/ino check.
+      if (!viaHandle) {
+        const atReal = await stat(real);
+        if (atReal.dev !== opened.dev || atReal.ino !== opened.ino) {
+          return { kind: 'skipped', reason: 'changed' };
+        }
       }
     } catch (error) {
       // Deleted or renamed after the open (an editor's atomic save, a build): that

@@ -116,8 +116,39 @@ describe('readBoundedFile', () => {
     }
   });
 
+  it('skips a file deleted between the listing and the open instead of aborting the scan', async () => {
+    const root = await makeDirectory();
+    expect(await readBoundedFile(join(root, 'gone.ts'), 100, root)).toEqual({ kind: 'skipped', reason: 'changed' });
+  });
+
+  it('skips a file whose parent was replaced by a plain file (ENOTDIR)', async () => {
+    const root = await makeDirectory();
+    await writeFile(join(root, 'src'), 'now a file');
+    expect(await readBoundedFile(join(root, 'src', 'a.ts'), 100, root)).toEqual({ kind: 'skipped', reason: 'changed' });
+  });
+
+  it('reports a looping parent directory as changed, not as a symlinked file', async () => {
+    if (process.platform === 'win32') return;
+    const root = await makeDirectory();
+    await symlink(join(root, 'loop'), join(root, 'loop'));
+    expect(await readBoundedFile(join(root, 'loop', 'a.ts'), 100, root)).toEqual({ kind: 'skipped', reason: 'changed' });
+  });
+
+  it('does not open anything when no bytes are left', async () => {
+    const root = await makeDirectory();
+    await writeFile(join(root, 'a.ts'), '');
+    expect(await readBoundedFile(join(root, 'a.ts'), 0, root)).toEqual({ kind: 'skipped', reason: 'too-large' });
+  });
+
   it('still raises an error it does not understand, as readFile did', async () => {
     const root = await makeDirectory();
-    await expect(readBoundedFile(join(root, 'missing.ts'), 100, root)).rejects.toThrow();
+    await mkdir(join(root, 'dir'));
+    await chmod(join(root, 'dir'), 0o000);
+    try {
+      if (process.getuid?.() === 0) return; // root ignores the mode
+      await expect(readBoundedFile(join(root, 'dir', 'a.ts'), 100, root)).rejects.toThrow();
+    } finally {
+      await chmod(join(root, 'dir'), 0o755);
+    }
   });
 });
