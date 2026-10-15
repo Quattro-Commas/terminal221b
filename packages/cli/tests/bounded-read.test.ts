@@ -194,18 +194,6 @@ describe('readBoundedFile', () => {
     expect(await readBoundedFile(join(root, 'locked.ts'), 100, root)).toEqual({ kind: 'skipped', reason: 'unreadable' });
   });
 
-  it('skips a socket on macOS, where open fails with EOPNOTSUPP', async () => {
-    const root = await makeDirectory();
-    await writeFile(join(root, 'a.ts'), 'x');
-    const failing = (async () => {
-      throw Object.assign(new Error('operation not supported on socket'), { code: 'EOPNOTSUPP' });
-    }) as unknown as typeof open;
-    expect(await readBoundedFile(join(root, 'a.ts'), 100, root, { open: failing })).toEqual({
-      kind: 'skipped',
-      reason: 'not-a-regular-file',
-    });
-  });
-
   it('skips a file rewritten to the same size while it was read', async () => {
     const root = await makeDirectory();
     await writeFile(join(root, 'a.ts'), 'abcd');
@@ -217,11 +205,12 @@ describe('readBoundedFile', () => {
         fd: handle.fd,
         read: handle.read.bind(handle),
         close: handle.close.bind(handle),
-        stat: async () => {
-          const real = await handle.stat();
+        stat: async (options?: { bigint: true }) => {
+          const real = await handle.stat(options ?? { bigint: true });
           stats += 1;
           if (stats === 1) return real;
-          return Object.assign(Object.create(Object.getPrototypeOf(real)), real, { mtimeMs: real.mtimeMs + 1000 });
+          // One nanosecond later: the comparison must be finer than milliseconds.
+          return Object.assign(Object.create(Object.getPrototypeOf(real)), real, { mtimeNs: real.mtimeNs + 1n });
         },
       };
     }) as unknown as typeof open;
@@ -252,6 +241,26 @@ describe('readBoundedFile', () => {
       };
     }) as unknown as typeof open;
     expect(await readBoundedFile(file, 100, root, { open: growing })).toEqual({ kind: 'skipped', reason: 'changed' });
+  });
+
+  it('skips a non-file whose open fails with a code Node cannot name (macOS socket)', async () => {
+    if (process.platform === 'win32') return;
+    const root = await makeDirectory();
+    const server = createServer();
+    await new Promise<void>((done) => server.listen(join(root, 'sock.ts'), done));
+    try {
+      // On macOS a socket open fails with errno 102 (EOPNOTSUPP), which libuv does not
+      // name; Node reports an "Unknown system error" code. Simulate that code here.
+      const failing = (async () => {
+        throw Object.assign(new Error('Unknown system error -102'), { code: 'Unknown system error -102' });
+      }) as unknown as typeof open;
+      expect(await readBoundedFile(join(root, 'sock.ts'), 100, root, { open: failing })).toEqual({
+        kind: 'skipped',
+        reason: 'not-a-regular-file',
+      });
+    } finally {
+      await new Promise<void>((done) => server.close(() => done()));
+    }
   });
 
   it('still raises an error it does not understand, as readFile did', async () => {

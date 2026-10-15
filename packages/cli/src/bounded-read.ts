@@ -68,7 +68,11 @@ const UNREADABLE_OPEN_ERRORS = new Set(['EACCES', 'EPERM', 'EAGAIN', 'EWOULDBLOC
  *    difference means a parent directory or the file was swapped (for a link out of
  *    the root, or to another directory inside it) after the listing;
  *  - at most `min(size, maxBytes) + 1` bytes read, so growth after the check is
- *    caught rather than returned as a truncated file.
+ *    caught rather than returned as a truncated file;
+ *  - the handle is fstat-ed again after the read: a changed size, mtime or ctime
+ *    (compared in nanoseconds) means 'changed'. This catches a same-size rewrite only
+ *    to the filesystem's timestamp resolution (1 s on HFS+, a coarse tick on older
+ *    Linux kernels); a rewrite within one tick is not detectable.
  *
  * The byte budget callers keep counts bytes on disk (`bytes`), not the decoded
  * string length.
@@ -110,9 +114,8 @@ export async function readBoundedFile(
       // Deleted, or a parent replaced, between the directory listing and the open.
       return { kind: 'skipped', reason: 'changed' };
     }
-    if (code === 'EISDIR' || code === 'ENXIO' || code === 'ENODEV' || code === 'EOPNOTSUPP') {
-      // directory, socket (ENXIO on Linux, EOPNOTSUPP on macOS), device
-      return { kind: 'skipped', reason: 'not-a-regular-file' };
+    if (code === 'EISDIR' || code === 'ENXIO' || code === 'ENODEV') {
+      return { kind: 'skipped', reason: 'not-a-regular-file' }; // directory, socket, device
     }
     if (UNREADABLE_OPEN_ERRORS.has(code)) {
       // An unreadable file over the cap is 'too-large', as under the old size check
@@ -122,12 +125,18 @@ export async function readBoundedFile(
       if (size !== undefined && size > maxBytes) return { kind: 'skipped', reason: 'too-large' };
       return { kind: 'skipped', reason: 'unreadable' };
     }
+    // Any other failure: if what sits at the path is not a regular file (a socket on
+    // macOS fails with errno 102, which libuv cannot even name), skip it; a real error
+    // on a regular file still throws. The lstat decides only what to report; nothing
+    // is opened after it.
+    const kind = await lstat(path).then((s) => (s.isFile() ? 'file' : 'other'), () => 'gone');
+    if (kind === 'other') return { kind: 'skipped', reason: 'not-a-regular-file' };
     throw error;
   }
   try {
-    const opened = await handle.stat();
+    const opened = await handle.stat({ bigint: true });
     if (!opened.isFile()) return { kind: 'skipped', reason: 'not-a-regular-file' };
-    if (opened.size > maxBytes) return { kind: 'skipped', reason: 'too-large' };
+    if (opened.size > BigInt(maxBytes)) return { kind: 'skipped', reason: 'too-large' };
 
     try {
       const real = await openedPath(path, handle.fd, deps);
@@ -143,7 +152,8 @@ export async function readBoundedFile(
       throw error;
     }
 
-    const buffer = Buffer.alloc(Math.min(opened.size, maxBytes) + 1);
+    const size = Number(opened.size);
+    const buffer = Buffer.alloc(Math.min(size, maxBytes) + 1);
     let bytes = 0;
     while (bytes < buffer.length) {
       const { bytesRead } = await handle.read(buffer, bytes, buffer.length - bytes, bytes);
@@ -153,17 +163,15 @@ export async function readBoundedFile(
     // Not what the handle reported: the file grew or shrank while being read, so what
     // is in the buffer is not the file. Checked before any size verdict: a file that
     // grows past the cap mid-read changed; it was not too large when opened.
-    if (bytes !== opened.size) return { kind: 'skipped', reason: 'changed' };
+    if (bytes !== size) return { kind: 'skipped', reason: 'changed' };
     // Same size is not proof: a file truncated and rewritten to the same length during
     // the read leaves old and new pages mixed in the buffer. Any change to the handle's
-    // size, mtime, ctime or inode since the first fstat means the bytes are not one file.
-    const after = await handle.stat();
-    if (
-      after.size !== opened.size ||
-      after.mtimeMs !== opened.mtimeMs ||
-      after.ctimeMs !== opened.ctimeMs ||
-      after.ino !== opened.ino
-    ) {
+    // size, mtime or ctime since the first fstat means the bytes are not one file. The
+    // times are compared in nanoseconds, so this catches a rewrite to the resolution
+    // of the filesystem's own timestamps (1 s on HFS+, a coarse tick on older Linux):
+    // a same-size rewrite inside one tick is not detectable here.
+    const after = await handle.stat({ bigint: true });
+    if (after.size !== opened.size || after.mtimeNs !== opened.mtimeNs || after.ctimeNs !== opened.ctimeNs) {
       return { kind: 'skipped', reason: 'changed' };
     }
     return { kind: 'read', content: buffer.subarray(0, bytes).toString('utf8'), bytes };
