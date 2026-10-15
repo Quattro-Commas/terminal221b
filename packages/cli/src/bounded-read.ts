@@ -1,13 +1,20 @@
 import { constants } from 'node:fs';
-import { lstat, open, readlink, realpath, stat } from 'node:fs/promises';
-import { isAbsolute, relative, sep } from 'node:path';
+import { lstat, open, readlink, realpath } from 'node:fs/promises';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 
 export type BoundedRead =
   | { kind: 'read'; content: string; bytes: number }
   | {
       kind: 'skipped';
-      reason: 'symlink' | 'not-a-regular-file' | 'too-large' | 'outside-root' | 'changed';
+      reason: 'symlink' | 'not-a-regular-file' | 'too-large' | 'outside-root' | 'changed' | 'unreadable';
     };
+
+/** Test seams: the platform probe and the two filesystem calls that are hard to make fail. */
+export interface BoundedReadDeps {
+  linux?: boolean;
+  open?: typeof open;
+  realpath?: (path: string) => Promise<string>;
+}
 
 // What open(O_NOFOLLOW) reports for a symlink: ELOOP on Linux and macOS, EMLINK on
 // FreeBSD, EFTYPE on NetBSD.
@@ -26,18 +33,22 @@ export function isWithinRoot(root: string, candidate: string): boolean {
 
 // Where the opened file really is. On Linux /proc/self/fd/N names the file the
 // handle holds, so no later swap of a parent directory can change the answer. Other
-// platforms resolve the path again and compare inodes: a narrower check that a
-// precisely timed second swap could still pass.
-async function openedPath(path: string, fd: number): Promise<{ real: string; viaHandle: boolean }> {
-  if (process.platform === 'linux') {
+// platforms resolve the path again: a narrower check that a precisely timed second
+// swap could still pass.
+async function openedPath(path: string, fd: number, deps: BoundedReadDeps): Promise<string> {
+  if (deps.linux ?? process.platform === 'linux') {
     try {
-      return { real: await readlink(`/proc/self/fd/${fd}`), viaHandle: true };
+      return await readlink(`/proc/self/fd/${fd}`);
     } catch {
       // /proc not mounted: fall through to the portable check
     }
   }
-  return { real: await realpath(path), viaHandle: false };
+  return (deps.realpath ?? realpath)(path);
 }
+
+// Errors that mean "this one file changed or cannot be read now", never "stop the scan".
+const CHANGED_AFTER_OPEN = new Set(['ENOENT', 'ENOTDIR', 'ELOOP', 'EACCES']);
+const UNREADABLE_OPEN_ERRORS = new Set(['EACCES', 'EPERM', 'EAGAIN', 'EWOULDBLOCK']);
 
 /**
  * Reads one file of a scanned workspace so that what is read is provably the file
@@ -52,24 +63,34 @@ async function openedPath(path: string, fd: number): Promise<{ real: string; via
  *  - one `open` with `O_NOFOLLOW` (a symlinked file fails to open) and `O_NONBLOCK`
  *    (a file swapped for a FIFO cannot hang the scan);
  *  - type and size taken from the handle;
- *  - the opened file must resolve inside `root` and be the same file (device and
- *    inode) as the real path: a swapped parent directory, or a symlink on a
- *    platform without `O_NOFOLLOW`, is refused here;
+ *  - the opened file's real path must equal `path` exactly. Callers pass paths built
+ *    from the real `root` by a walker that never descends symlinks, so any
+ *    difference means a parent directory or the file was swapped (for a link out of
+ *    the root, or to another directory inside it) after the listing;
  *  - at most `min(size, maxBytes) + 1` bytes read, so growth after the check is
  *    caught rather than returned as a truncated file.
  *
- * Errors other than the skips above are raised, as `readFile` raised them.
+ * The byte budget callers keep counts bytes on disk (`bytes`), not the decoded
+ * string length.
+ *
+ * An unreadable file (permissions, EAGAIN) is skipped as 'unreadable', never an
+ * aborted scan. Errors nobody anticipated are still raised.
  *
  * Not covered: the directory walk itself (readdir/visit on a directory swapped for a
  * symlink after it was listed). Only the file read is guarded here; directory
  * traversal is a separate follow-up.
  */
-export async function readBoundedFile(path: string, maxBytes: number, root: string): Promise<BoundedRead> {
+export async function readBoundedFile(
+  path: string,
+  maxBytes: number,
+  root: string,
+  deps: BoundedReadDeps = {}
+): Promise<BoundedRead> {
   // Nothing can fit: do not open, fstat or readlink a file only to refuse it.
   if (maxBytes < 1) return { kind: 'skipped', reason: 'too-large' };
   let handle;
   try {
-    handle = await open(
+    handle = await (deps.open ?? open)(
       path,
       constants.O_RDONLY |
         (constants.O_NOFOLLOW ?? 0) |
@@ -92,12 +113,13 @@ export async function readBoundedFile(path: string, maxBytes: number, root: stri
     if (code === 'EISDIR' || code === 'ENXIO' || code === 'ENODEV') {
       return { kind: 'skipped', reason: 'not-a-regular-file' }; // directory, socket, device
     }
-    if (code === 'EACCES' || code === 'EPERM') {
-      // The old size check needed no read permission, so an unreadable file over the
-      // cap was skipped, not an error. Keep that: look at its size only after the open
+    if (UNREADABLE_OPEN_ERRORS.has(code)) {
+      // An unreadable file over the cap is 'too-large', as under the old size check
+      // (which needed no read permission). Look at its size only after the open
       // failed, and never open it again.
       const size = await lstat(path).then((s) => s.size, () => undefined);
       if (size !== undefined && size > maxBytes) return { kind: 'skipped', reason: 'too-large' };
+      return { kind: 'skipped', reason: 'unreadable' };
     }
     throw error;
   }
@@ -107,21 +129,16 @@ export async function readBoundedFile(path: string, maxBytes: number, root: stri
     if (opened.size > maxBytes) return { kind: 'skipped', reason: 'too-large' };
 
     try {
-      const { real, viaHandle } = await openedPath(path, handle.fd);
-      if (!isWithinRoot(root, real)) return { kind: 'skipped', reason: 'outside-root' };
-      // /proc names the file the handle holds, so a comparison adds nothing there (and
-      // would turn a benign rename after the open into 'changed'). Only the path
-      // re-resolution fallback needs the dev/ino check.
-      if (!viaHandle) {
-        const atReal = await stat(real);
-        if (atReal.dev !== opened.dev || atReal.ino !== opened.ino) {
-          return { kind: 'skipped', reason: 'changed' };
-        }
+      const real = await openedPath(path, handle.fd, deps);
+      if (real !== resolve(path)) {
+        return { kind: 'skipped', reason: isWithinRoot(root, real) ? 'changed' : 'outside-root' };
       }
     } catch (error) {
-      // Deleted or renamed after the open (an editor's atomic save, a build): that
-      // one file changed under us; the scan goes on.
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'skipped', reason: 'changed' };
+      // Deleted, renamed or re-permissioned after the open (an editor's atomic save, a
+      // build): that one file changed under us; the scan goes on.
+      if (CHANGED_AFTER_OPEN.has((error as NodeJS.ErrnoException).code ?? '')) {
+        return { kind: 'skipped', reason: 'changed' };
+      }
       throw error;
     }
 

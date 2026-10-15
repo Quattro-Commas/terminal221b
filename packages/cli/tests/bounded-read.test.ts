@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, open, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -140,16 +140,66 @@ describe('readBoundedFile', () => {
     expect(await readBoundedFile(join(root, 'a.ts'), 0, root)).toEqual({ kind: 'skipped', reason: 'too-large' });
   });
 
+  it('refuses a file reached through a parent swapped for a symlink to another directory inside the root', async () => {
+    const root = await makeDirectory();
+    await mkdir(join(root, 'b'));
+    await writeFile(join(root, 'b', 'x.ts'), 'other file in the workspace');
+    // The walker listed root/a/x.ts; root/a has since become a link to root/b.
+    await symlink(join(root, 'b'), join(root, 'a'));
+    for (const linux of [true, false]) {
+      const result = await readBoundedFile(join(root, 'a', 'x.ts'), 100, root, { linux });
+      expect(result).toEqual({ kind: 'skipped', reason: 'changed' });
+    }
+  });
+
+  it.each(['ENOTDIR', 'ELOOP', 'EACCES', 'ENOENT'])(
+    'without /proc, maps %s from resolving the opened path to changed',
+    async (code) => {
+      const root = await makeDirectory();
+      await writeFile(join(root, 'a.ts'), 'x');
+      const failing = async (): Promise<string> => {
+        throw Object.assign(new Error(code), { code });
+      };
+      expect(await readBoundedFile(join(root, 'a.ts'), 100, root, { linux: false, realpath: failing })).toEqual({
+        kind: 'skipped',
+        reason: 'changed',
+      });
+    }
+  );
+
+  it('without /proc, still reads a plain file', async () => {
+    const root = await makeDirectory();
+    await writeFile(join(root, 'a.ts'), 'x');
+    expect(await readBoundedFile(join(root, 'a.ts'), 100, root, { linux: false })).toMatchObject({ kind: 'read' });
+  });
+
+  it.each(['EACCES', 'EPERM', 'EAGAIN', 'EWOULDBLOCK'])('skips a file whose open fails with %s as unreadable', async (code) => {
+    const root = await makeDirectory();
+    await writeFile(join(root, 'a.ts'), 'small');
+    const failing = (async () => {
+      throw Object.assign(new Error(code), { code });
+    }) as unknown as typeof open;
+    expect(await readBoundedFile(join(root, 'a.ts'), 100, root, { open: failing })).toEqual({
+      kind: 'skipped',
+      reason: 'unreadable',
+    });
+  });
+
+  it('skips a small unreadable file instead of aborting the scan', async () => {
+    if (process.getuid?.() === 0) return;
+    const root = await makeDirectory();
+    await writeFile(join(root, 'locked.ts'), 'small');
+    await chmod(join(root, 'locked.ts'), 0o000);
+    expect(await readBoundedFile(join(root, 'locked.ts'), 100, root)).toEqual({ kind: 'skipped', reason: 'unreadable' });
+  });
+
   it('still raises an error it does not understand, as readFile did', async () => {
     const root = await makeDirectory();
-    await mkdir(join(root, 'dir'));
-    await chmod(join(root, 'dir'), 0o000);
-    try {
-      if (process.getuid?.() === 0) return; // root ignores the mode
-      await expect(readBoundedFile(join(root, 'dir', 'a.ts'), 100, root)).rejects.toThrow();
-    } finally {
-      await chmod(join(root, 'dir'), 0o755);
-    }
+    await writeFile(join(root, 'a.ts'), 'x');
+    const failing = (async () => {
+      throw Object.assign(new Error('input/output error'), { code: 'EIO' });
+    }) as unknown as typeof open;
+    await expect(readBoundedFile(join(root, 'a.ts'), 100, root, { open: failing })).rejects.toThrow('input/output error');
   });
 });
 
