@@ -110,8 +110,9 @@ export async function readBoundedFile(
       // Deleted, or a parent replaced, between the directory listing and the open.
       return { kind: 'skipped', reason: 'changed' };
     }
-    if (code === 'EISDIR' || code === 'ENXIO' || code === 'ENODEV') {
-      return { kind: 'skipped', reason: 'not-a-regular-file' }; // directory, socket, device
+    if (code === 'EISDIR' || code === 'ENXIO' || code === 'ENODEV' || code === 'EOPNOTSUPP') {
+      // directory, socket (ENXIO on Linux, EOPNOTSUPP on macOS), device
+      return { kind: 'skipped', reason: 'not-a-regular-file' };
     }
     if (UNREADABLE_OPEN_ERRORS.has(code)) {
       // An unreadable file over the cap is 'too-large', as under the old size check
@@ -149,10 +150,22 @@ export async function readBoundedFile(
       if (bytesRead === 0) break;
       bytes += bytesRead;
     }
-    if (bytes > maxBytes) return { kind: 'skipped', reason: 'too-large' };
     // Not what the handle reported: the file grew or shrank while being read, so what
-    // is in the buffer is not the file.
+    // is in the buffer is not the file. Checked before any size verdict: a file that
+    // grows past the cap mid-read changed; it was not too large when opened.
     if (bytes !== opened.size) return { kind: 'skipped', reason: 'changed' };
+    // Same size is not proof: a file truncated and rewritten to the same length during
+    // the read leaves old and new pages mixed in the buffer. Any change to the handle's
+    // size, mtime, ctime or inode since the first fstat means the bytes are not one file.
+    const after = await handle.stat();
+    if (
+      after.size !== opened.size ||
+      after.mtimeMs !== opened.mtimeMs ||
+      after.ctimeMs !== opened.ctimeMs ||
+      after.ino !== opened.ino
+    ) {
+      return { kind: 'skipped', reason: 'changed' };
+    }
     return { kind: 'read', content: buffer.subarray(0, bytes).toString('utf8'), bytes };
   } finally {
     await handle.close();

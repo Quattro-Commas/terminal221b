@@ -1,3 +1,4 @@
+import { appendFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, open, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
@@ -191,6 +192,66 @@ describe('readBoundedFile', () => {
     await writeFile(join(root, 'locked.ts'), 'small');
     await chmod(join(root, 'locked.ts'), 0o000);
     expect(await readBoundedFile(join(root, 'locked.ts'), 100, root)).toEqual({ kind: 'skipped', reason: 'unreadable' });
+  });
+
+  it('skips a socket on macOS, where open fails with EOPNOTSUPP', async () => {
+    const root = await makeDirectory();
+    await writeFile(join(root, 'a.ts'), 'x');
+    const failing = (async () => {
+      throw Object.assign(new Error('operation not supported on socket'), { code: 'EOPNOTSUPP' });
+    }) as unknown as typeof open;
+    expect(await readBoundedFile(join(root, 'a.ts'), 100, root, { open: failing })).toEqual({
+      kind: 'skipped',
+      reason: 'not-a-regular-file',
+    });
+  });
+
+  it('skips a file rewritten to the same size while it was read', async () => {
+    const root = await makeDirectory();
+    await writeFile(join(root, 'a.ts'), 'abcd');
+    // The handle reports a new mtime after the read: same size, different content.
+    const rewritten = (async (path: string, flags: number) => {
+      const handle = await open(path, flags);
+      let stats = 0;
+      return {
+        fd: handle.fd,
+        read: handle.read.bind(handle),
+        close: handle.close.bind(handle),
+        stat: async () => {
+          const real = await handle.stat();
+          stats += 1;
+          if (stats === 1) return real;
+          return Object.assign(Object.create(Object.getPrototypeOf(real)), real, { mtimeMs: real.mtimeMs + 1000 });
+        },
+      };
+    }) as unknown as typeof open;
+    expect(await readBoundedFile(join(root, 'a.ts'), 100, root, { open: rewritten })).toEqual({
+      kind: 'skipped',
+      reason: 'changed',
+    });
+  });
+
+  it('calls a file that grows past the cap while being read changed, not too-large', async () => {
+    const root = await makeDirectory();
+    const file = join(root, 'edge.ts');
+    await writeFile(file, 'x'.repeat(100));
+    const growing = (async (path: string, flags: number) => {
+      const handle = await open(path, flags);
+      let grown = false;
+      return {
+        fd: handle.fd,
+        stat: handle.stat.bind(handle),
+        close: handle.close.bind(handle),
+        read: async (...args: Parameters<typeof handle.read>) => {
+          if (!grown) {
+            appendFileSync(file, 'y');
+            grown = true;
+          }
+          return handle.read(...args);
+        },
+      };
+    }) as unknown as typeof open;
+    expect(await readBoundedFile(file, 100, root, { open: growing })).toEqual({ kind: 'skipped', reason: 'changed' });
   });
 
   it('still raises an error it does not understand, as readFile did', async () => {
