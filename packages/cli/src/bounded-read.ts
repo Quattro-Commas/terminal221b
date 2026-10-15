@@ -131,6 +131,9 @@ export async function readBoundedFile(
     // is opened after it.
     const kind = await lstat(path).then((s) => (s.isFile() ? 'file' : 'other'), () => 'gone');
     if (kind === 'other') return { kind: 'skipped', reason: 'not-a-regular-file' };
+    // Nothing there any more: deleted or a parent swapped between listing and open,
+    // the same race ENOENT/ENOTDIR already report as 'changed'.
+    if (kind === 'gone') return { kind: 'skipped', reason: 'changed' };
     throw error;
   }
   try {

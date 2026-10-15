@@ -263,6 +263,18 @@ describe('readBoundedFile', () => {
     }
   });
 
+  it('skips as changed when an unnamed open failure is followed by the path vanishing', async () => {
+    const root = await makeDirectory();
+    // Open fails with a code Node cannot name, and by the time we look, nothing is there.
+    const failing = (async () => {
+      throw Object.assign(new Error('Unknown system error -102'), { code: 'Unknown system error -102' });
+    }) as unknown as typeof open;
+    expect(await readBoundedFile(join(root, 'gone.ts'), 100, root, { open: failing })).toEqual({
+      kind: 'skipped',
+      reason: 'changed',
+    });
+  });
+
   it('still raises an error it does not understand, as readFile did', async () => {
     const root = await makeDirectory();
     await writeFile(join(root, 'a.ts'), 'x');
