@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { generateKeyPairSync, createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseCaseBundle } from '../src/case.js';
+import { parseCaseBundle, type ConfirmationRecord } from '../src/case.js';
 import { FIXTURE_NOW, fixtureBundle as unsignedFixture } from '../src/case-fixtures.js';
 import {
   ATTESTED_KINDS,
@@ -20,6 +20,7 @@ import {
   putBundle,
   purgeExpired,
   readManifest,
+  readNoticeLines,
   saveRetentionPolicy,
   readPrivateKeyPem,
   readTransitions,
@@ -400,9 +401,9 @@ describe('store root and layout', () => {
   it('creates the layout and an empty trust list on init', async () => {
     const root = scratchRoot('init');
     await initStore(root, FIXTURE_NOW);
-    expect(readManifest(root)).toEqual({ version: 1, trustedKeys: [] });
+    expect(readManifest(root)).toEqual({ version: 2, trustedKeys: [] });
     expect(readdirSync(root).sort()).toEqual(
-      expect.arrayContaining(['bundles', 'manifest.json', 'objects', 'transitions.jsonl'])
+      expect.arrayContaining(['bundles', 'manifest.json', 'objects', 'transitions.d'])
     );
   });
 
@@ -426,9 +427,9 @@ describe('store root and layout', () => {
     const pem = privateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
     const marker = pem.split('\n')[1];
     const walk = (dir: string): void => {
-      for (const name of readdirSync(dir)) {
-        const at = join(dir, name);
-        if (statSync(at).isDirectory()) walk(at);
+      for (const dirent of readdirSync(dir, { withFileTypes: true })) {
+        const at = join(dir, dirent.name);
+        if (dirent.isDirectory()) walk(at);
         else expect(readFileSync(at, 'utf8')).not.toContain(marker);
       }
     };
@@ -472,17 +473,20 @@ describe('trusting a key', () => {
     );
   });
 
-  it('rejects a manifest entry that is not a usable public key', async () => {
+  it('skips a manifest entry that is not a usable public key, so a signature by it fails closed', async () => {
     const root = scratchRoot('trust-broken');
     await initStore(root, FIXTURE_NOW);
     writeFileSync(
       join(root, 'manifest.json'),
       JSON.stringify({
         version: 1,
-        trustedKeys: [{ keyId: 'bad', publicKeySpkiDerBase64: 'bm90LWEtkeyk=', addedAt: FIXTURE_NOW }],
+        trustedKeys: [{ keyId: KEY_ID, publicKeySpkiDerBase64: 'bm90LWEtkeyk=', addedAt: FIXTURE_NOW }],
       })
     );
-    expect(() => confirmationSignatureChecker(readManifest(root))).toThrow(/not a usable public key/);
+    const confirmation = recordsOfKind(signedFixture, 'confirmation')[0] as ConfirmationRecord;
+    const checker = confirmationSignatureChecker(readManifest(root));
+    expect(confirmationSignatureChecker(trusted)(confirmation)).toBe(true);
+    expect(checker(confirmation)).toBe(false);
   });
 
   it('refuses a private key file presented where a signing key is expected', () => {
@@ -520,7 +524,8 @@ describe('accepting a bundle', () => {
     await initStore(root, FIXTURE_NOW);
     trustKey(root, { keyId: KEY_ID, publicKey }, FIXTURE_NOW);
     await putBundle(root, unsignedFixture, { now: FIXTURE_NOW, baseDir: baseDir() }).catch(() => undefined);
-    expect(readdirSync(join(root, 'bundles'))).toEqual([]);
+    // The format fence is not a written bundle, so dot-files are not counted.
+    expect(readdirSync(join(root, 'bundles')).filter((name) => !name.startsWith('.'))).toEqual([]);
   });
 
   it('stores a fully signed and digest-verified bundle', async () => {
@@ -548,8 +553,7 @@ describe('accepting a bundle', () => {
     await initStore(root, FIXTURE_NOW);
     trustKey(root, { keyId: KEY_ID, publicKey }, FIXTURE_NOW);
     await putBundle(root, signedFixture, { now: FIXTURE_NOW, baseDir: baseDir() });
-    const lines = readFileSync(join(root, 'transitions.jsonl'), 'utf8').trim().split('\n');
-    expect(lines.map((line) => JSON.parse(line).action)).toEqual(['init', 'trust', 'put']);
+    expect(readTransitions(root).map((line) => line.action)).toEqual(['init', 'trust', 'put']);
   });
 
   it('files a multi-case bundle under the first case, keeping one scope per entry', async () => {
@@ -624,7 +628,9 @@ describe('reading a bundle back out', () => {
     trustKey(root, { keyId: KEY_ID, publicKey }, FIXTURE_NOW);
     await putBundle(root, signedFixture, { now: FIXTURE_NOW, baseDir: baseDir() });
     // Revoke trust by rewriting the manifest: the stored bytes are unchanged.
-    writeFileSync(join(root, 'manifest.json'), JSON.stringify({ version: 1, trustedKeys: [] }));
+    // Trust lives in keys/ as well as the manifest, so revoking means clearing both.
+    writeFileSync(join(root, 'manifest.json'), JSON.stringify({ version: 2, trustedKeys: [] }));
+    rmSync(join(root, 'keys'), { recursive: true, force: true });
     await expect(
       getBundle(root, 'case-exact-in-scope', 1, { now: FIXTURE_NOW, baseDir: baseDir() })
     ).rejects.toThrow(/is unknown-key/);
@@ -635,7 +641,9 @@ describe('reading a bundle back out', () => {
     await initStore(root, FIXTURE_NOW);
     trustKey(root, { keyId: KEY_ID, publicKey }, FIXTURE_NOW);
     await putBundle(root, signedFixture, { now: FIXTURE_NOW, baseDir: baseDir() });
-    writeFileSync(join(root, 'manifest.json'), JSON.stringify({ version: 1, trustedKeys: [] }));
+    // Trust lives in keys/ as well as the manifest, so revoking means clearing both.
+    writeFileSync(join(root, 'manifest.json'), JSON.stringify({ version: 2, trustedKeys: [] }));
+    rmSync(join(root, 'keys'), { recursive: true, force: true });
     const got = await getBundle(root, 'case-exact-in-scope', 1, {
       now: FIXTURE_NOW,
       baseDir: baseDir(),
@@ -661,6 +669,33 @@ describe('reading a bundle back out', () => {
     await expect(
       getBundle(root, 'case-exact-in-scope', 7, { now: FIXTURE_NOW, baseDir: baseDir() })
     ).rejects.toThrow(/no revision 7.*it has 1/);
+  });
+});
+
+describe('what `case store get` tells the operator', () => {
+  const base = { entry: 'case-a', revision: 3 };
+  const report = (problems: string[]) => ({ ok: problems.length === 0, problems, entries: [], sources: [], signatures: [] });
+
+  it('keeps the existing line when the revision verifies', () => {
+    expect(readNoticeLines({ ...base, report: report([]) })).toEqual(['case-a revision 3 re-verified on read']);
+  });
+
+  it('prints every problem and does not claim re-verification when there are some', () => {
+    const lines = readNoticeLines({ ...base, report: report(['one', 'two']) });
+    expect(lines.slice(0, 2)).toEqual(['problem: one', 'problem: two']);
+    expect(lines.join('\n')).not.toMatch(/re-verified/);
+    expect(lines[2]).toMatch(/did NOT verify \(2 problem/);
+  });
+
+  it('is what getBundle with strict:false produces for a tampered revision', async () => {
+    const root = scratchRoot('notice-tampered');
+    await initStore(root, FIXTURE_NOW);
+    trustKey(root, { keyId: KEY_ID, publicKey }, FIXTURE_NOW);
+    await putBundle(root, signedFixture, { now: FIXTURE_NOW, baseDir: baseDir() });
+    const at = join(root, 'bundles', entryName(signedFixture), '1.json');
+    writeFileSync(at, `${readFileSync(at, 'utf8')} `);
+    const got = await getBundle(root, entryName(signedFixture), undefined, { now: FIXTURE_NOW, baseDir: baseDir(), strict: false });
+    expect(readNoticeLines(got).join('\n')).toMatch(/problem: .*no longer hashes/);
   });
 });
 

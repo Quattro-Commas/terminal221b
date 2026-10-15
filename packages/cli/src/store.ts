@@ -1,7 +1,7 @@
 /**
  * The local case store: a directory on this machine that holds accepted case
- * bundles, the public keys their operator signatures are checked against, and an
- * append-only transition log.
+ * bundles, the public keys their operator signatures are checked against, and
+ * the transition logs that vouch for what was written.
  *
  * Three rules the store exists to enforce, and the reason each one cannot live
  * in the schema layer:
@@ -11,11 +11,26 @@
  *    hashing the actual file turns it into a check.
  * 2. A record that asserts a human decided something carries a detached
  *    signature, and the store refuses to accept an unsigned one (F4). The
- *    public keys live in the manifest; the private key never enters a bundle
- *    and is never written here.
+ *    public keys live in `keys/` (one file each) plus the manifest's frozen
+ *    base list; the private key never enters a bundle and is never written here.
  * 3. Remote sources are never fetched. An `https://` source is recorded as
  *    unverifiable-here and left alone, because a store whose integrity check
  *    performs network egress is not a local store.
+ *
+ * Concurrency: there is no lock. Writers claim names with an exclusive create
+ * (`createExclusive`: write a temp file, hard-link it to the final name, so a
+ * loser gets EEXIST instead of replacing). `put` claims `<n>.json` and retries
+ * with jitter on a collision; a trust or init is one exclusive file; each
+ * writer process appends only to its own `transitions.d/` log, so no two
+ * writers share a file and the layout holds across hosts. Because a revision
+ * file can exist a moment before its transition does, a read without an
+ * explicit revision returns the newest *vouched* revision, and `verify` may
+ * report an in-flight write as unvouched; there is deliberately no time-based
+ * grace. A purge condemns an object by renaming it aside and re-checks for
+ * references before deleting; together with `put`'s post-append object check an
+ * object in use is not lost on a local filesystem. Over NFS that re-check can
+ * read stale directory attributes, so the guarantee is weaker there. See
+ * docs/adr/0001-lock-free-case-store.md.
  */
 import {
   createHash,
@@ -27,21 +42,13 @@ import {
 } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import {
-  appendFileSync,
-  closeSync,
   existsSync,
-  fsyncSync,
   mkdirSync,
-  openSync,
   readFileSync,
   readdirSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-  writeSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   ApprovalRecord,
@@ -52,8 +59,20 @@ import {
   RETENTION_CLASSES,
   validateCaseBundle,
 } from './case.js';
+import {
+  createExclusive,
+  errnoCode,
+  appendWhole,
+  frameLine,
+  resolveContext,
+  writeDurable as writeDurableWith,
+  type StoreContext,
+  type StoreRuntime,
+} from './store-io.js';
 
-const SCHEMA_VERSION = 1;
+/** What a fresh store is written as. Version 1 stores are still read, and migrated by initStore. */
+const SCHEMA_VERSION = 2;
+const READABLE_VERSIONS: readonly number[] = [1, 2];
 /** Bumping this changes what a signature commits to, so old signatures stop verifying. */
 export const SIGNATURE_CONTEXT = 'terminal221b/record-signature/v1';
 
@@ -172,8 +191,14 @@ export interface StorePaths {
   manifest: string;
   bundles: string;
   objects: string;
+  /** One file per trusted key, `<sha256(keyId) hex>.json`, created exclusively. */
+  keys: string;
+  /** Legacy shared append log. Read when present, never written by this version. */
   transitions: string;
-  lock: string;
+  /** One log file per writer process; see recordTransition. */
+  transitionsDir: string;
+  /** The pid lock version 1 CLIs took around every write. Never created by this version; only its existence is checked before a migration. */
+  legacyLock: string;
 }
 
 /**
@@ -203,8 +228,10 @@ export function storePaths(root: string): StorePaths {
     manifest: join(at, 'manifest.json'),
     bundles: join(at, 'bundles'),
     objects: join(at, 'objects'),
+    keys: join(at, 'keys'),
     transitions: join(at, 'transitions.jsonl'),
-    lock: join(at, '.lock'),
+    transitionsDir: join(at, 'transitions.d'),
+    legacyLock: join(at, '.lock'),
   };
 }
 
@@ -212,93 +239,129 @@ export function storePaths(root: string): StorePaths {
 /* Durable writes                                                               */
 /* -------------------------------------------------------------------------- */
 
-function fsyncDir(path: string): void {
-  let fd: number | undefined;
-  try {
-    fd = openSync(path, 'r');
-    fsyncSync(fd);
-  } catch {
-    // A directory that cannot be opened for reading cannot be fsynced; the
-    // rename below is still atomic, so the write is safe without this.
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-  }
-}
-
-/**
- * temp file -> fsync -> rename -> fsync parent. The rename is the atomic step,
- * so a reader never observes a half-written bundle or manifest.
- */
-function writeDurable(path: string, bytes: Buffer | string): void {
-  const target = resolve(path);
-  const parent = dirname(target);
-  mkdirSync(parent, { recursive: true });
-  const temp = join(parent, `.${basenameOf(target)}.tmp-${process.pid}`);
-  const fd = openSync(temp, 'w');
-  try {
-    if (Buffer.isBuffer(bytes)) writeSync(fd, bytes);
-    else writeSync(fd, bytes);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(temp, target);
-  fsyncDir(parent);
-}
-
-function basenameOf(path: string): string {
-  const parts = resolve(path).split(sep);
-  return parts[parts.length - 1];
-}
-
-/**
- * A cooperative lock: advisory, taken by writing our pid, released by removing
- * it. Two concurrent `put`s in the same store would otherwise both compute the
- * next revision from the same on-disk state and one would overwrite the other.
- */
-export function withStoreLock<T>(paths: StorePaths, body: () => T): T {
-  mkdirSync(paths.root, { recursive: true });
-  if (existsSync(paths.lock)) {
-    const holder = readFileSync(paths.lock, 'utf8').trim();
-    const alive = /^\d+$/.test(holder) && isProcessAlive(Number(holder));
-    if (alive) {
-      throw new Error(`the case store is locked by process ${holder}`);
-    }
-    rmSync(paths.lock, { force: true });
-  }
-  writeFileSync(paths.lock, `${process.pid}\n`);
-  try {
-    return body();
-  } finally {
-    rmSync(paths.lock, { force: true });
-  }
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /* -------------------------------------------------------------------------- */
 /* Manifest                                                                     */
 /* -------------------------------------------------------------------------- */
 
-export async function initStore(root: string, now: string): Promise<StorePaths> {
+/**
+ * Creates the store, or finishes creating one, or upgrades a version 1 store.
+ * There is no lock to wait on and nothing here fails because another process is
+ * active: the directories are `mkdir -p`, the manifest is claimed with an
+ * exclusive create, and only the process that created it records `init`.
+ */
+export async function initStore(root: string, now: string, context?: StoreContext): Promise<StorePaths> {
   const paths = storePaths(root);
-  mkdirSync(paths.bundles, { recursive: true });
-  mkdirSync(paths.objects, { recursive: true });
-  if (!existsSync(paths.transitions)) writeFileSync(paths.transitions, '');
-  if (!existsSync(paths.manifest)) {
-    writeDurable(paths.manifest, `${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: [] }, null, 2)}\n`);
-    recordTransition(paths, { at: now, action: 'init', detail: `store initialised at ${paths.root}` });
+  const runtime = resolveContext(context);
+  for (const dir of [paths.bundles, paths.objects, paths.keys, paths.transitionsDir]) {
+    mkdirSync(dir, { recursive: true });
   }
+  runtime.step('init:before-manifest');
+  // Manifest first, fence second, the same order as a migration: a v1 manifest
+  // that turns up here is migrated (or refused on its .lock) without a fence
+  // having been laid ahead of that decision.
+  const fresh = createExclusive(
+    runtime,
+    paths.manifest,
+    Buffer.from(`${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: [] }, null, 2)}\n`, 'utf8')
+  );
+  if (!fresh && frozenKeysOfV1(paths) !== undefined) {
+    migrateStore(paths, now, runtime);
+    return paths;
+  }
+  ensureFence(paths, runtime);
+  if (fresh) recordTransition(runtime, paths, { at: now, action: 'init', detail: `store initialised at ${paths.root}` });
   return paths;
 }
 
+/** Lays down bundles/.format-v2 if a crash lost it after the manifest was written. */
+function ensureFence(paths: StorePaths, runtime: StoreRuntime): void {
+  const fence = join(paths.bundles, FORMAT_FENCE);
+  if (!existsSync(fence)) {
+    mkdirSync(paths.bundles, { recursive: true });
+    createExclusive(runtime, fence, FENCE_BYTES);
+  }
+}
+
+/**
+ * Every writer calls this first, so no lock-free write path reaches a version 1
+ * store: it is migrated (and so fenced against old binaries) before the first
+ * write, or, if a leftover .lock shows an older CLI used it last, the write is
+ * refused with nothing changed.
+ */
+function upgradeIfV1(paths: StorePaths, now: string, runtime: StoreRuntime): void {
+  if (!existsSync(paths.manifest)) return;
+  if (frozenKeysOfV1(paths) !== undefined) migrateStore(paths, now, runtime);
+  else ensureFence(paths, runtime); // a crash after the manifest write can have lost the fence
+}
+
+/** The base key list if the manifest is still version 1, otherwise undefined (including while it is mid-write). */
+function frozenKeysOfV1(paths: StorePaths): TrustedKey[] | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(paths.manifest, 'utf8'));
+  } catch (error) {
+    if (error instanceof SyntaxError || errnoCode(error) === 'ENOENT') return undefined;
+    throw error;
+  }
+  const value = parsed as { version?: unknown; trustedKeys?: unknown } | null;
+  if (value?.version === 1 && Array.isArray(value.trustedKeys)) return value.trustedKeys as TrustedKey[];
+  return undefined;
+}
+
+export function keyFileName(keyId: string): string {
+  return `${sha256(keyId).slice('sha256:'.length)}.json`;
+}
+
+function isTrustedKey(value: unknown): value is TrustedKey {
+  const record = value as Record<string, unknown> | null;
+  return (
+    !!record &&
+    typeof record === 'object' &&
+    typeof record.keyId === 'string' &&
+    typeof record.publicKeySpkiDerBase64 === 'string'
+  );
+}
+
+/**
+ * The per-key files under keys/. A file that does not parse (the exclusive-create
+ * fallback can expose one mid-write) trusts nothing and is reported rather than
+ * thrown, so one damaged file cannot take the whole store offline.
+ */
+export function readKeyDirectory(
+  root: string,
+  runtime: StoreRuntime = resolveContext()
+): { keys: TrustedKey[]; problems: string[] } {
+  const paths = storePaths(root);
+  let names: string[] = [];
+  try {
+    names = runtime.io.readdir(paths.keys);
+  } catch (error) {
+    if (errnoCode(error) !== 'ENOENT') throw error;
+  }
+  const keys: TrustedKey[] = [];
+  const problems: string[] = [];
+  for (const name of names.sort()) {
+    if (name.startsWith('.') || !name.endsWith('.json')) continue;
+    try {
+      const value: unknown = JSON.parse(runtime.io.readFile(join(paths.keys, name)).toString('utf8'));
+      if (!isTrustedKey(value)) throw new Error('not a trusted key record');
+      if (keyFileName(value.keyId) !== name) throw new Error(`file name does not match keyId ${value.keyId}`);
+      keys.push(value);
+    } catch (error) {
+      if (errnoCode(error) === 'ENOENT') continue;
+      problems.push(`keys/${name} is unusable: ${(error as Error).message}`);
+    }
+  }
+  keys.sort((a, b) => (a.addedAt + a.keyId < b.addedAt + b.keyId ? -1 : 1));
+  return { keys, problems };
+}
+
+/**
+ * The manifest's trustedKeys are a frozen base list: nothing appends to them
+ * any more, because rewriting one shared file is a read-modify-write that loses
+ * a concurrent trust. New keys live one-per-file under keys/, and the trust set
+ * is the union of the two.
+ */
 export function readManifest(root: string): StoreManifest {
   const paths = storePaths(root);
   if (!existsSync(paths.manifest)) {
@@ -309,24 +372,28 @@ export function readManifest(root: string): StoreManifest {
     throw new Error('the store manifest must be a JSON object');
   }
   const value = parsed as Record<string, unknown>;
-  if (value.version !== SCHEMA_VERSION) {
+  if (typeof value.version !== 'number' || !READABLE_VERSIONS.includes(value.version)) {
     throw new Error(`unsupported store manifest version: ${String(value.version)}`);
   }
-  const keys = value.trustedKeys;
-  if (!Array.isArray(keys)) throw new Error('the store manifest must list trustedKeys');
-  return { version: SCHEMA_VERSION, trustedKeys: keys as TrustedKey[] };
+  const frozen = value.trustedKeys;
+  if (!Array.isArray(frozen)) throw new Error('the store manifest must list trustedKeys');
+  const known = new Set((frozen as TrustedKey[]).map((entry) => entry.keyId));
+  const extra = readKeyDirectory(root).keys.filter((entry) => !known.has(entry.keyId));
+  return { version: value.version, trustedKeys: [...(frozen as TrustedKey[]), ...extra] };
 }
 
 export function trustKey(
   root: string,
   key: { keyId: string; publicKey: KeyObject | Buffer; label?: string },
-  now: string
+  now: string,
+  context?: StoreContext
 ): TrustedKey {
   const paths = storePaths(root);
-  const manifest = readManifest(root);
-  if (manifest.trustedKeys.some((entry) => entry.keyId === key.keyId)) {
-    throw new Error(`keyId ${key.keyId} is already trusted; choose another keyId or remove the entry first`);
-  }
+  const runtime = resolveContext(context);
+  upgradeIfV1(paths, now, runtime);
+  const alreadyTrusted = () =>
+    new Error(`keyId ${key.keyId} is already trusted; choose another keyId or remove the entry first`);
+  if (readManifest(root).trustedKeys.some((entry) => entry.keyId === key.keyId)) throw alreadyTrusted();
   const parsedKey = Buffer.isBuffer(key.publicKey)
     ? createPublicKey({ key: key.publicKey, format: 'der', type: 'spki' })
     : key.publicKey;
@@ -340,19 +407,113 @@ export function trustKey(
     ...(key.label === undefined ? {} : { label: key.label }),
     addedAt: now,
   };
-  const next: StoreManifest = { version: SCHEMA_VERSION, trustedKeys: [...manifest.trustedKeys, entry] };
-  withStoreLock(paths, () => {
-    writeDurable(paths.manifest, `${JSON.stringify(next, null, 2)}\n`);
-    recordTransition(paths, { at: now, action: 'trust', detail: `trusted key ${key.keyId}` });
-  });
+  runtime.step('trust:before-create');
+  mkdirSync(paths.keys, { recursive: true });
+  // The name is derived from the keyId, so two trusts of one keyId collide on
+  // the same file and exactly one wins; different keyIds never contend.
+  const created = createExclusive(
+    runtime,
+    join(paths.keys, keyFileName(key.keyId)),
+    Buffer.from(`${JSON.stringify(entry, null, 2)}\n`, 'utf8')
+  );
+  if (!created) throw alreadyTrusted();
+  recordTransition(runtime, paths, { at: now, action: 'trust', detail: `trusted key ${key.keyId}` });
   return entry;
 }
 
+/**
+ * Brings a version 1 store up to version 2. Only a store whose `.lock` file does
+ * not exist at all (whatever it contains) is migrated: a lock file means an
+ * older terminal221b used the store last, and upgrading underneath one that may
+ * still be running is not supported. In that case this refuses and changes
+ * nothing; the operator confirms no old CLI is running, deletes the file, and
+ * retries.
+ *
+ * Idempotent, and safe to run from several new migrators at once: the order is
+ * lock check, then each v1 key copied into keys/ (an exclusive create), then the
+ * v2 manifest (a rewrite with identical bytes, since every migrator read the
+ * same v1 list), and last bundles/.format-v2. The fence goes last so a refusal
+ * or a crash never leaves a store fenced but not migrated; initStore lays it
+ * down again if only that step was lost.
+ *
+ * bundles/.format-v2 is a regular file where an old CLI expects only entry
+ * directories. Its listEntries readdir()s it as if it were one and fails with
+ * ENOTDIR, so an old binary cannot keep writing a migrated store. (The version
+ * number fences it as well: an old readManifest rejects 2.) Entry names cannot
+ * collide with it, because they must start alphanumeric.
+ */
+function migrateStore(paths: StorePaths, now: string, runtime: StoreRuntime): void {
+  const keys = v1KeysOf(paths);
+  if (keys === undefined) return; // someone else finished the migration
+  if (runtime.io.readdir(paths.root).includes(LEGACY_LOCK_NAME)) {
+    throw new Error(
+      `this store was last used by an older terminal221b and still has its lock file ${paths.legacyLock}; ` +
+        'make sure no older terminal221b is running, delete the file, and retry'
+    );
+  }
+  mkdirSync(paths.keys, { recursive: true });
+  mkdirSync(paths.transitionsDir, { recursive: true });
+  for (const key of keys.filter(isTrustedKey)) {
+    createExclusive(
+      runtime,
+      join(paths.keys, keyFileName(key.keyId)),
+      Buffer.from(`${JSON.stringify(key, null, 2)}\n`, 'utf8')
+    );
+  }
+  runtime.step('migrate:keys-copied');
+  writeDurableWith(runtime, paths.manifest, `${JSON.stringify({ version: SCHEMA_VERSION, trustedKeys: keys }, null, 2)}\n`);
+  createExclusive(runtime, join(paths.bundles, FORMAT_FENCE), FENCE_BYTES);
+  recordTransition(runtime, paths, { at: now, action: 'migrate', detail: 'store layout upgraded from version 1 to 2' });
+}
+
+const LEGACY_LOCK_NAME = '.lock';
+
+/** The key list of the manifest on disk if it is still version 1, otherwise undefined. */
+function v1KeysOf(paths: StorePaths): TrustedKey[] | undefined {
+  const bytes = readManifestBytes(paths);
+  return bytes === undefined ? undefined : v1KeysIn(bytes);
+}
+
+function readManifestBytes(paths: StorePaths): Buffer | undefined {
+  try {
+    return readFileSync(paths.manifest);
+  } catch (error) {
+    if (errnoCode(error) === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+/** The key list of a version 1 manifest, or undefined if these bytes are not one (including mid-write). */
+function v1KeysIn(bytes: Buffer): TrustedKey[] | undefined {
+  try {
+    const value = JSON.parse(bytes.toString('utf8')) as { version?: unknown; trustedKeys?: unknown } | null;
+    if (value?.version === 1 && Array.isArray(value.trustedKeys)) return value.trustedKeys as TrustedKey[];
+  } catch {
+    // Not parseable: not a manifest we can migrate from.
+  }
+  return undefined;
+}
+
+/** Skipped by every directory listing of bundles/; see migrateStore. */
+const FORMAT_FENCE = '.format-v2';
+const FENCE_BYTES = Buffer.from('terminal221b case store format 2\n');
+
+/**
+ * Verifier objects for every usable trusted key. A key whose bytes do not parse
+ * is left out and reported (see verifyStore) rather than thrown, so one damaged
+ * key record cannot take get, put and verify offline; a signature by that keyId
+ * then fails as an unknown key.
+ */
 function trustedKeyObjects(manifest: StoreManifest): Map<string, KeyObject> {
-  const out = new Map<string, KeyObject>();
+  return buildKeyObjects(manifest).keys;
+}
+
+function buildKeyObjects(manifest: StoreManifest): { keys: Map<string, KeyObject>; problems: string[] } {
+  const keys = new Map<string, KeyObject>();
+  const problems: string[] = [];
   for (const entry of manifest.trustedKeys) {
     try {
-      out.set(
+      keys.set(
         entry.keyId,
         createPublicKey({
           key: Buffer.from(entry.publicKeySpkiDerBase64, 'base64'),
@@ -361,10 +522,10 @@ function trustedKeyObjects(manifest: StoreManifest): Map<string, KeyObject> {
         })
       );
     } catch {
-      throw new Error(`trusted key ${entry.keyId} in the store manifest is not a usable public key`);
+      problems.push(`trusted key ${entry.keyId} is not a usable public key; signatures by it cannot be verified`);
     }
   }
-  return out;
+  return { keys, problems };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -380,17 +541,127 @@ export interface Transition {
   bundleDigest?: string;
 }
 
-function recordTransition(paths: StorePaths, transition: Transition): void {
-  appendFileSync(paths.transitions, `${JSON.stringify(transition)}\n`);
+/** Well under PIPE_BUF-scale sizes, so one append stays one write on a local filesystem. */
+const MAX_LINE_BYTES = 4096;
+
+/** Fits `transition` into one log line by shortening its free-text detail, never its identifying fields. */
+function boundedLine(transition: Transition): string {
+  let current = transition;
+  let json = JSON.stringify(current);
+  while (Buffer.byteLength(json) + 2 > MAX_LINE_BYTES && current.detail) {
+    const keep = Math.floor(current.detail.length / 2);
+    current = { ...current, detail: keep > 0 ? `${current.detail.slice(0, keep)}...` : undefined };
+    json = JSON.stringify(current);
+  }
+  if (Buffer.byteLength(json) + 2 > MAX_LINE_BYTES) {
+    throw new Error('a transition line exceeds the 4 KB log line limit even without its detail');
+  }
+  return json;
+}
+
+const writerLogs = new Map<string, string>();
+
+function safeHostname(hostname: string): string {
+  const cleaned = hostname.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64);
+  return cleaned === '' ? 'host' : cleaned;
+}
+
+/**
+ * Appends to this writer's own log, `transitions.d/<host>-<pid>-<random>.jsonl`.
+ * Nothing else ever appends to that file, so no two writers interleave bytes in
+ * it even on a filesystem whose O_APPEND is not atomic across hosts (NFS). The
+ * file is created exclusively on first use; the random part keeps a recycled pid
+ * from adopting a dead process's file.
+ *
+ * Each record is one buffer, framed by a leading newline, in one write: a crash
+ * can tear at most the last line, and the next append starts on a fresh line so
+ * the tear never swallows a good record.
+ */
+function recordTransition(runtime: StoreRuntime, paths: StorePaths, transition: Transition): void {
+  const line = frameLine(boundedLine(transition));
+  const key = `${paths.root}\0${runtime.hostname}\0${runtime.pid}`;
+  const known = writerLogs.get(key);
+  if (known !== undefined) {
+    try {
+      appendWhole(runtime, known, line, false);
+      return;
+    } catch (error) {
+      if (errnoCode(error) !== 'ENOENT') throw error;
+      writerLogs.delete(key);
+    }
+  }
+  mkdirSync(paths.transitionsDir, { recursive: true });
+  const created = join(
+    paths.transitionsDir,
+    `${safeHostname(runtime.hostname)}-${runtime.pid}-${runtime.randomHex(8)}.jsonl`
+  );
+  appendWhole(runtime, created, line, true);
+  writerLogs.set(key, created);
+}
+
+export interface TransitionLog {
+  transitions: Transition[];
+  /** Lines that did not parse, as `file: excerpt`. verify reports them; readers skip them. */
+  unreadable: string[];
+}
+
+/**
+ * Merges the legacy shared log (if any) with every per-writer log. Identical
+ * lines collapse to one, so a purge that was repeated after a crash counts
+ * once. Order across files is not meaningful; consumers look records up by
+ * (entry, revision) and never rely on position.
+ */
+export function readTransitionLog(root: string, runtime: StoreRuntime = resolveContext()): TransitionLog {
+  const paths = storePaths(root);
+  const files: string[] = [];
+  if (existsSync(paths.transitions)) files.push(paths.transitions);
+  let names: string[] = [];
+  try {
+    names = runtime.io.readdir(paths.transitionsDir);
+  } catch (error) {
+    if (errnoCode(error) !== 'ENOENT') throw error;
+  }
+  for (const name of names.sort()) {
+    if (!name.startsWith('.') && name.endsWith('.jsonl')) files.push(join(paths.transitionsDir, name));
+  }
+  const seen = new Set<string>();
+  const transitions: Transition[] = [];
+  const unreadable: string[] = [];
+  for (const file of files) {
+    let text: string;
+    try {
+      text = runtime.io.readFile(file).toString('utf8');
+    } catch (error) {
+      if (errnoCode(error) === 'ENOENT') continue;
+      throw error;
+    }
+    for (const raw of text.split('\n')) {
+      const line = raw.trim();
+      if (line === '' || seen.has(line)) continue;
+      seen.add(line);
+      const parsed = parseTransition(line);
+      if (parsed) transitions.push(parsed);
+      else unreadable.push(`${relative(paths.root, file)}: ${line.slice(0, 60)}`);
+    }
+  }
+  return { transitions, unreadable };
+}
+
+function parseTransition(line: string): Transition | undefined {
+  try {
+    const value: unknown = JSON.parse(line);
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const record = value as Record<string, unknown>;
+      if (typeof record.at === 'string' && typeof record.action === 'string') return record as unknown as Transition;
+    }
+  } catch {
+    // An unparseable line is reported by verify, not thrown from a read.
+  }
+  return undefined;
 }
 
 export function readTransitions(root: string): Transition[] {
-  const paths = storePaths(root);
-  if (!existsSync(paths.transitions)) return [];
-  return readFileSync(paths.transitions, 'utf8')
-    .split('\n')
-    .filter((line) => line.trim() !== '')
-    .map((line) => JSON.parse(line) as Transition);
+  return readTransitionLog(root).transitions;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -677,11 +948,16 @@ export function entryName(bundle: CaseBundle, explicit?: string): string {
   return name;
 }
 
-function listRevisions(paths: StorePaths, entry: string): number[] {
-  const dir = join(paths.bundles, entry);
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir)
-    .filter((name) => name.endsWith('.json'))
+function listRevisions(runtime: StoreRuntime, paths: StorePaths, entry: string): number[] {
+  let names: string[];
+  try {
+    names = runtime.io.readdir(join(paths.bundles, entry));
+  } catch (error) {
+    if (errnoCode(error) === 'ENOENT') return [];
+    throw error;
+  }
+  return names
+    .filter((name) => !name.startsWith('.') && name.endsWith('.json'))
     .map((name) => Number(name.replace(/\.json$/, '')))
     .filter((n) => Number.isInteger(n) && n > 0)
     .sort((a, b) => a - b);
@@ -697,6 +973,65 @@ export interface PutOptions extends SourceCheckOptions {
   entry?: string;
   /** When false, unsigned human records are accepted but reported. Default: refuse. */
   allowUnsigned?: boolean;
+  /** Test seam: filesystem, step hooks and writer identity. Production passes nothing. */
+  context?: StoreContext;
+}
+
+const MAX_CLAIM_ATTEMPTS = 20;
+const BACKOFF_MIN_MS = 1;
+const BACKOFF_MAX_MS = 25;
+
+function objectPathFor(paths: StorePaths, bundleDigest: string): string {
+  return join(paths.objects, bundleDigest.replace(':', '-'));
+}
+
+/**
+ * Makes sure the content-addressed object for `bundleDigest` exists and hashes
+ * to it. The name is derived from the bytes, so an existing object with the
+ * right digest IS this object and losing the create race is success. One with
+ * the wrong digest is corrupt, and is replaced by temp+rename: the name is
+ * already taken, so claiming it is no longer the question.
+ */
+function ensureObject(runtime: StoreRuntime, paths: StorePaths, bundleDigest: string, bytes: Buffer): void {
+  const path = objectPathFor(paths, bundleDigest);
+  mkdirSync(paths.objects, { recursive: true });
+  if (createExclusive(runtime, path, bytes)) return;
+  let existing: Buffer | undefined;
+  try {
+    existing = runtime.io.readFile(path);
+  } catch (error) {
+    // Condemned by a concurrent purge between our create and our read.
+    if (errnoCode(error) !== 'ENOENT') throw error;
+  }
+  if (existing !== undefined && sha256(existing) === bundleDigest) return;
+  writeDurableWith(runtime, path, bytes);
+}
+
+/**
+ * Claims the next revision number by creating `<n>.json` exclusively. Two
+ * writers that computed the same n cannot both win; the loser re-lists, which
+ * now shows the winner's file, and takes n+1. Numbers are never reused because
+ * the only thing that ever removes a revision file is a purge, and a purge never
+ * removes the newest one.
+ */
+async function claimRevision(
+  runtime: StoreRuntime,
+  paths: StorePaths,
+  entry: string,
+  bytes: Buffer
+): Promise<number> {
+  mkdirSync(join(paths.bundles, entry), { recursive: true });
+  for (let attempt = 1; attempt <= MAX_CLAIM_ATTEMPTS; attempt += 1) {
+    const revision = (listRevisions(runtime, paths, entry).at(-1) ?? 0) + 1;
+    await runtime.step('put:before-claim');
+    if (createExclusive(runtime, bundlePathFor(paths, entry, revision), bytes)) return revision;
+    if (attempt === MAX_CLAIM_ATTEMPTS) break;
+    const jitter = BACKOFF_MIN_MS + Math.floor(Math.random() * (BACKOFF_MAX_MS - BACKOFF_MIN_MS + 1));
+    await runtime.sleep(jitter);
+  }
+  throw new Error(
+    `too much contention on ${entry}: could not claim a revision after ${MAX_CLAIM_ATTEMPTS} attempts; try again`
+  );
 }
 
 /**
@@ -735,20 +1070,27 @@ export async function putBundle(root: string, bundle: CaseBundle, options: PutOp
   const serialized = `${JSON.stringify(bundle, null, 2)}\n`;
   const bundleDigest = sha256(serialized);
 
-  return withStoreLock(paths, () => {
-    const revision = (listRevisions(paths, entry).at(-1) ?? 0) + 1;
-    writeDurable(bundlePathFor(paths, entry, revision), serialized);
-    writeDurable(join(paths.objects, bundleDigest.replace(':', '-')), serialized);
-    recordTransition(paths, {
-      at: options.now,
-      action: 'put',
-      entry,
-      revision,
-      bundleDigest,
-      detail: `${signatures.filter((entry) => entry.status === 'signed').length} signed human records`,
-    });
-    return { entry, revision, bundleDigest, storedAt: options.now, sources };
+  const runtime = resolveContext(options.context);
+  upgradeIfV1(paths, options.now, runtime);
+  const bytes = Buffer.from(serialized, 'utf8');
+  ensureObject(runtime, paths, bundleDigest, bytes);
+  await runtime.step('put:object-written');
+  const revision = await claimRevision(runtime, paths, entry, bytes);
+  await runtime.step('put:claimed');
+  recordTransition(runtime, paths, {
+    at: options.now,
+    action: 'put',
+    entry,
+    revision,
+    bundleDigest,
+    detail: `${signatures.filter((entry) => entry.status === 'signed').length} signed human records`,
   });
+  await runtime.step('put:after-append');
+  // A purge may have condemned the object between our write and our append,
+  // judging it unreferenced because our transition did not exist yet. Now that
+  // the transition does, put the object back if it is gone.
+  ensureObject(runtime, paths, bundleDigest, bytes);
+  return { entry, revision, bundleDigest, storedAt: options.now, sources };
 }
 
 export interface GetOptions extends SourceCheckOptions {
@@ -772,20 +1114,51 @@ export async function getBundle(
   options: GetOptions
 ): Promise<GetResult> {
   const paths = storePaths(root);
-  const revisions = listRevisions(paths, entry);
+  const revisions = listRevisions(resolveContext(), paths, entry);
+  const transitions = readTransitions(root);
   if (revisions.length === 0) {
     throw new Error(`the store holds no revisions of ${entry}`);
   }
-  const target = revision ?? revisions[revisions.length - 1];
+  const vouched = revisions.filter((n) => transitions.some((line) => isVouching(line, entry, n)));
+  // Without an explicit revision the answer is the newest one a transition
+  // vouches for. The newest file may be a put still in flight, or one that
+  // crashed before recording itself, and serving it would hand out bytes
+  // nothing vouches for.
+  if (revision === undefined && vouched.length === 0) {
+    throw new Error(
+      `${entry} has revision file(s) ${revisions.join(', ')} but no transition vouches for any of them; a write may be in flight or incomplete`
+    );
+  }
+  const target = revision ?? vouched[vouched.length - 1];
   if (!revisions.includes(target)) {
     throw new Error(`the store holds no revision ${target} of ${entry}; it has ${revisions.join(', ')}`);
   }
   const manifest = readManifest(root);
   const stored = readFileSync(bundlePathFor(paths, entry, target), 'utf8');
-  const bundle = parseCaseBundle(JSON.parse(stored));
+  let bundle: CaseBundle;
+  try {
+    bundle = parseCaseBundle(JSON.parse(stored));
+  } catch (error) {
+    throw new Error(
+      vouched.includes(target)
+        ? `revision ${target} of ${entry} is corrupt: ${(error as Error).message}`
+        : `revision ${target} of ${entry} is incomplete or unvouched (no transition records it; a write may be in flight)`
+    );
+  }
   const signatures = verifyBundleSignatures(bundle, trustedKeyObjects(manifest));
   const sources = await checkSourceDigests(bundle, options);
+  // The same two rules verifyStore applies. The digest compared against is the
+  // one the put recorded in the log; hashing the bytes just read and comparing
+  // them to themselves would pass by construction.
+  const recorded = transitions.find((line) => isVouching(line, entry, target))?.bundleDigest;
+  const provenance =
+    recorded === undefined
+      ? [`${entry} revision ${target} has no transition recording its digest, so nothing vouches for these bytes`]
+      : sha256(stored) !== recorded
+        ? [`${entry} revision ${target} no longer hashes to its recorded digest`]
+        : [];
   const problems = [
+    ...provenance,
     ...validateCaseBundle(bundle),
     ...sourceMismatchProblems(sources),
     ...signatures
@@ -799,18 +1172,45 @@ export async function getBundle(
   return { entry, revision: target, bundle, report };
 }
 
-export function listEntries(root: string): StoreEntry[] {
+/**
+ * The stderr lines `case store get` prints. With --no-verify a failing report
+ * is returned rather than thrown, so every problem is shown and the revision is
+ * not claimed to have been re-verified.
+ */
+export function readNoticeLines(got: Pick<GetResult, 'entry' | 'revision' | 'report'>): string[] {
+  const { entry, revision, report } = got;
+  if (report.problems.length === 0) return [`${entry} revision ${revision} re-verified on read`];
+  return [
+    ...report.problems.map((problem) => `problem: ${problem}`),
+    `${entry} revision ${revision} did NOT verify (${report.problems.length} problem(s)); the bytes below are unverified`,
+  ];
+}
+
+function isVouching(line: Transition, entry: string, revision: number): boolean {
+  return line.action === 'put' && line.entry === entry && line.revision === revision && !!line.bundleDigest;
+}
+
+/**
+ * Revision files are listed BEFORE the transition log is read. A put appends its
+ * transition after creating the revision file, so this order can only err toward
+ * "file seen, transition not yet" (reported unvouched), never toward a vouched
+ * revision whose file we did not list. The reverse order could hide a revision
+ * that was fully written in between.
+ */
+export function listEntries(root: string, runtime: StoreRuntime = resolveContext()): StoreEntry[] {
   const paths = storePaths(root);
   if (!existsSync(paths.bundles)) return [];
-  const transitions = readTransitions(root);
-  const entries: StoreEntry[] = [];
+  const listed: { name: string; revisions: number[] }[] = [];
   for (const name of readdirSync(paths.bundles).sort()) {
-    const dir = join(paths.bundles, name);
-    if (!existsSync(dir)) continue;
-    for (const revision of listRevisions(paths, name)) {
-      const recorded = transitions.find(
-        (line) => line.entry === name && line.revision === revision && line.bundleDigest
-      );
+    if (name.startsWith('.')) continue;
+    if (!existsSync(join(paths.bundles, name))) continue;
+    listed.push({ name, revisions: listRevisions(runtime, paths, name) });
+  }
+  const transitions = readTransitionLog(root, runtime).transitions;
+  const entries: StoreEntry[] = [];
+  for (const { name, revisions } of listed) {
+    for (const revision of revisions) {
+      const recorded = transitions.find((line) => isVouching(line, name, revision));
       entries.push({
         entry: name,
         revision,
@@ -822,6 +1222,76 @@ export function listEntries(root: string): StoreEntry[] {
   return entries;
 }
 
+/**
+ * Exactly the names `tempNameFor` (`.<name>.tmp-<hex>`) and `collectObject`
+ * (`.condemned-<digest>-<hex>`) produce. Both start with a dot, which no entry
+ * or revision name can (SAFE_ENTRY starts alphanumeric), so a valid entry such
+ * as `build.tmp-2` is never mistaken for a leftover.
+ */
+const LEFTOVER = /^\..+\.tmp-[0-9a-f]+$|^\.condemned-.+-[0-9a-f]+$/;
+
+/**
+ * Temp and condemned files are what an interrupted write or purge leaves. Readers
+ * ignore them; this reports them so they do not accumulate unseen. There is
+ * deliberately no cleanup command and no age threshold: a file this old or new
+ * could still belong to a live writer, and the store has no clock it trusts.
+ * Because of that, verify run during a write can also report that write's temp
+ * file, or a revision a put has created but not yet recorded: both are
+ * transient and disappear on the next run.
+ */
+function findLeftovers(paths: StorePaths, runtime: StoreRuntime): string[] {
+  const dirs = [paths.root, paths.bundles, paths.objects, paths.keys, paths.transitionsDir];
+  try {
+    for (const name of runtime.io.readdir(paths.bundles)) {
+      if (!name.startsWith('.')) dirs.push(join(paths.bundles, name));
+    }
+  } catch (error) {
+    if (errnoCode(error) !== 'ENOENT' && errnoCode(error) !== 'ENOTDIR') throw error;
+  }
+  const out: string[] = [];
+  for (const dir of dirs) {
+    let names: string[];
+    try {
+      names = runtime.io.readdir(dir);
+    } catch (error) {
+      if (errnoCode(error) === 'ENOENT' || errnoCode(error) === 'ENOTDIR') continue;
+      throw error;
+    }
+    for (const name of names.sort()) {
+      if (LEFTOVER.test(name)) {
+        out.push(`leftover ${relative(paths.root, join(dir, name)) || name}: an interrupted write or purge left it behind`);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * putBundle writes the object before it claims a revision, so a put that fails
+ * or crashes in between (or loses a contended claim) leaves an object that no
+ * revision references. Report only: there is no clock to say it is not an
+ * in-flight put, so like the other leftovers it can be transient.
+ */
+function findOrphanObjects(paths: StorePaths, runtime: StoreRuntime, entries: StoreEntry[]): string[] {
+  const referenced = new Set(
+    entries.flatMap((entry) => (entry.bundleDigest === undefined ? [] : [basename(objectPathFor(paths, entry.bundleDigest))]))
+  );
+  let names: string[];
+  try {
+    names = runtime.io.readdir(paths.objects);
+  } catch (error) {
+    if (errnoCode(error) === 'ENOENT') return [];
+    throw error;
+  }
+  return names
+    .sort()
+    .filter((name) => !name.startsWith('.') && !referenced.has(name))
+    .map(
+      (name) =>
+        `objects/${name} is referenced by no vouched revision: a put that failed or crashed before claiming a revision left it behind`
+    );
+}
+
 /** Re-checks every stored bundle against the manifest keys and the local bytes. */
 export async function verifyStore(
   root: string,
@@ -829,13 +1299,24 @@ export async function verifyStore(
 ): Promise<VerifyReport> {
   const paths = storePaths(root);
   const manifest = readManifest(root);
-  const keys = trustedKeyObjects(manifest);
-  const problems: string[] = [];
+  const { keys, problems: keyProblems } = buildKeyObjects(manifest);
+  const problems: string[] = [...keyProblems];
   const allSources: SourceVerification[] = [];
   const allSignatures: SignatureReport[] = [];
-  const entries = listEntries(root);
+  const runtime = resolveContext();
+  const entries = listEntries(root, runtime);
+  problems.push(...readTransitionLog(root, runtime).unreadable.map((line) => `unreadable transition line in ${line}`));
+  problems.push(...readKeyDirectory(root, runtime).problems);
+  problems.push(...findLeftovers(paths, runtime));
+  problems.push(...findOrphanObjects(paths, runtime, entries));
   for (const entry of entries) {
-    const stored = readFileSync(bundlePathFor(paths, entry.entry, entry.revision), 'utf8');
+    let stored: string;
+    try {
+      stored = readFileSync(bundlePathFor(paths, entry.entry, entry.revision), 'utf8');
+    } catch (error) {
+      if (errnoCode(error) === 'ENOENT') continue; // purged since it was listed
+      throw error;
+    }
     const digest = sha256(stored);
     if (entry.bundleDigest === undefined) {
       problems.push(
@@ -850,7 +1331,17 @@ export async function verifyStore(
         problems.push(`${entry.entry} revision ${entry.revision} has no intact stored object`);
       }
     }
-    const bundle = parseCaseBundle(JSON.parse(stored));
+    let bundle: CaseBundle;
+    try {
+      bundle = parseCaseBundle(JSON.parse(stored));
+    } catch (error) {
+      problems.push(
+        entry.bundleDigest === undefined
+          ? `${entry.entry} revision ${entry.revision} is incomplete or unvouched: it does not parse and no transition records it (a write may be in flight)`
+          : `${entry.entry} revision ${entry.revision} is corrupt: ${(error as Error).message}`
+      );
+      continue;
+    }
     problems.push(...validateCaseBundle(bundle).map((line) => `${entry.entry}@${entry.revision}: ${line}`));
     const sources = await checkSourceDigests(bundle, options);
     problems.push(...sourceMismatchProblems(sources).map((line) => `${entry.entry}@${entry.revision}: ${line}`));
@@ -974,20 +1465,41 @@ function ageInDays(observedAt: string, now: string): number | null {
  * row, so the answer to "what would a purge take" is visible before anyone asks
  * for a purge.
  */
-export function retentionReport(root: string, windows: RetentionWindows, now: string): RetentionReport {
+export function retentionReport(
+  root: string,
+  windows: RetentionWindows,
+  now: string,
+  context?: StoreContext
+): RetentionReport {
   const paths = storePaths(root);
   if (!existsSync(paths.bundles)) {
     return { now, rows: [], counts: emptyCounts(), purgeable: [], token: sha256('retention:empty') };
   }
+  const runtime = resolveContext(context);
+  // One listing feeds both "newest" and the rows, so a put landing mid-report
+  // cannot make a row disagree with the revision it was compared against. Only
+  // vouched revisions count: a crashed or in-flight put leaves an unvouched file
+  // that must neither become "newest" (which would make the real newest vouched
+  // revision purgeable) nor be a purge candidate itself.
+  const vouched = listEntries(paths.root, runtime).filter((stored) => stored.bundleDigest !== undefined);
+  runtime.step('retention:listed');
   const newest = new Map<string, number>();
-  for (const entry of listEntries(paths.root)) {
+  for (const entry of vouched) {
     const current = newest.get(entry.entry);
     if (current === undefined || entry.revision > current) newest.set(entry.entry, entry.revision);
   }
 
   const rows: RetentionRow[] = [];
-  for (const stored of listEntries(paths.root)) {
-    const bundle = parseCaseBundle(JSON.parse(readFileSync(bundlePathFor(paths, stored.entry, stored.revision), 'utf8')));
+  for (const stored of vouched) {
+    let bundle: CaseBundle;
+    try {
+      bundle = parseCaseBundle(JSON.parse(readFileSync(bundlePathFor(paths, stored.entry, stored.revision), 'utf8')));
+    } catch (error) {
+      // Purged since it was listed: nothing to report. An unparseable vouched
+      // revision is corrupt, and verify is where that is named.
+      if (errnoCode(error) === 'ENOENT') continue;
+      throw error;
+    }
     const isNewest = newest.get(stored.entry) === stored.revision;
     for (const source of bundle.sources) {
       const days = windowFor(windows, source.retention);
@@ -1062,10 +1574,12 @@ export function purgeExpired(
   root: string,
   windows: RetentionWindows,
   now: string,
-  token: string
+  token: string,
+  context?: StoreContext
 ): PurgeResult {
   const paths = storePaths(root);
-  const report = retentionReport(root, windows, now);
+  const runtime = resolveContext(context);
+  const report = retentionReport(root, windows, now, context);
   if (report.purgeable.length === 0) {
     throw new Error(
       'nothing is past its retention window, so there is nothing to purge; run the report first and look at it'
@@ -1077,52 +1591,75 @@ export function purgeExpired(
     );
   }
 
+  upgradeIfV1(paths, now, runtime);
+  const digestOf = new Map(
+    listEntries(root, runtime).map((stored) => [`${stored.entry}@${stored.revision}`, stored.bundleDigest])
+  );
   const removed: PurgeResult['removed'] = [];
-  return withStoreLock(paths, () => {
-    for (const item of report.purgeable) {
-      const at = item.lastIndexOf('@');
-      const entry = item.slice(0, at);
-      const revision = Number(item.slice(at + 1));
-      const sources = report.rows
-        .filter((row) => row.entry === entry && row.revision === revision && row.status === 'past-window')
-        .map((row) => row.sourceId);
-      rmSync(bundlePathFor(paths, entry, revision), { force: true });
-      recordTransition(paths, {
-        at: now,
-        action: 'purge',
-        entry,
-        revision,
-        detail: `removed past its retention window: ${sources.join(', ')}`,
-      });
-      removed.push({ entry, revision, sources });
+  const purgedDigests = new Set<string>();
+  for (const item of report.purgeable) {
+    const at = item.lastIndexOf('@');
+    const entry = item.slice(0, at);
+    const revision = Number(item.slice(at + 1));
+    const sources = report.rows
+      .filter((row) => row.entry === entry && row.revision === revision && row.status === 'past-window')
+      .map((row) => row.sourceId);
+    // The record goes first. A crash between the two leaves a revision that is
+    // still there and still verifies, and a repeat purge writes the identical
+    // line again, which readers collapse. The other order could delete evidence
+    // with no trace of why.
+    recordTransition(runtime, paths, {
+      at: now,
+      action: 'purge',
+      entry,
+      revision,
+      detail: `removed past its retention window: ${sources.join(', ')}`,
+    });
+    runtime.step('purge:recorded');
+    try {
+      runtime.io.unlink(bundlePathFor(paths, entry, revision));
+    } catch (error) {
+      if (errnoCode(error) !== 'ENOENT') throw error;
     }
+    const digest = digestOf.get(item);
+    if (digest !== undefined) purgedDigests.add(digest);
+    removed.push({ entry, revision, sources });
+  }
+  runtime.step('purge:revisions-removed');
+  for (const digest of purgedDigests) collectObject(runtime, paths, digest);
+  return { removed, token: report.token };
+}
 
-    // The object store is content-addressed, so two revisions of the same bundle
-    // share one object file. Deleting the object of a purged revision would
-    // therefore delete the bytes a *surviving* revision still points at, and the
-    // store would fail its own integrity check on a store nothing tampered
-    // with. An object is only orphaned once no surviving revision names it.
-    const stillReferenced = new Set(
-      listEntries(paths.root)
-        .map((stored) => stored.bundleDigest)
-        .filter((digest): digest is string => digest !== undefined)
-    );
-    const purgedDigests = new Set(
-      removed
-        .map(({ entry, revision }) =>
-          readTransitions(root).find(
-            (line) => line.entry === entry && line.revision === revision && line.bundleDigest
-          )?.bundleDigest
-        )
-        .filter((digest): digest is string => digest !== undefined)
-    );
-    for (const digest of purgedDigests) {
-      if (!stillReferenced.has(digest)) {
-        rmSync(join(paths.objects, digest.replace(':', '-')), { force: true });
-      }
-    }
-    return { removed, token: report.token };
-  });
+/**
+ * Deletes the object for `digest` unless a surviving revision still names it.
+ *
+ * The object store is content-addressed, so revisions of identical bytes share
+ * one object, and deleting a purged revision's object would delete the bytes a
+ * surviving revision points at. With no lock to serialise against a concurrent
+ * `put`, the object is first renamed out of the way (condemned), and only then
+ * is the question asked: re-list the revisions, then re-read the transitions,
+ * and if any revision that exists is vouched by this digest, rename it back.
+ * `put` closes the other half: it appends its transition and only then checks
+ * the object, rewriting it if it was condemned in between. So whichever side
+ * moves second sees the other, and an object in use is not lost on a local
+ * filesystem. Over NFS the re-check can read stale directory attributes, so
+ * this guarantee is weaker there; `verify` reports a missing object either way.
+ *
+ * A crash leaves `.condemned-*` behind, which readers ignore and `verify` reports.
+ */
+function collectObject(runtime: StoreRuntime, paths: StorePaths, digest: string): void {
+  const object = objectPathFor(paths, digest);
+  const condemned = join(paths.objects, `.condemned-${digest.replace(':', '-')}-${runtime.randomHex(8)}`);
+  try {
+    runtime.io.rename(object, condemned);
+  } catch (error) {
+    if (errnoCode(error) === 'ENOENT') return;
+    throw error;
+  }
+  runtime.step('purge:condemned');
+  const inUse = listEntries(paths.root, runtime).some((stored) => stored.bundleDigest === digest);
+  if (inUse) runtime.io.rename(condemned, object);
+  else runtime.io.unlink(condemned);
 }
 
 /**
@@ -1207,9 +1744,12 @@ export function loadRetentionPolicy(root: string): RetentionPolicyFile | undefin
 export function saveRetentionPolicy(
   root: string,
   windows: RetentionWindows,
-  now: string
+  now: string,
+  context?: StoreContext
 ): { path: string; overwritten: boolean } {
   const paths = storePaths(root);
+  const runtime = resolveContext(context);
+  upgradeIfV1(paths, now, runtime);
   const at = retentionPolicyPath(paths);
   const existing = existsSync(at);
   mkdirSync(paths.root, { recursive: true });
@@ -1226,11 +1766,12 @@ export function saveRetentionPolicy(
       'A class absent from here is reported unconfigured and is never purged. operator_archive is never purged.',
     windows: ordered as RetentionWindows,
   };
-  writeDurable(at, `${JSON.stringify(file, null, 2)}\n`);
-  recordTransition(paths, {
+  const bytes = `${JSON.stringify(file, null, 2)}\n`;
+  writeDurableWith(runtime, at, bytes);
+  recordTransition(runtime, paths, {
     at: now,
     action: existing ? 'retention-policy-replaced' : 'retention-policy-recorded',
-    detail: `windows: ${Object.entries(ordered).map(([key, value]) => `${key}=${value}d`).join(', ') || 'none'}`,
+    detail: `windows: ${Object.entries(ordered).map(([key, value]) => `${key}=${value}d`).join(', ') || 'none'}; file ${sha256(bytes)}`,
   });
   return { path: at, overwritten: existing };
 }

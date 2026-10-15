@@ -15,6 +15,7 @@ import { fixtureBundleJson } from './case-fixtures.js';
 import { dossierReport, renderDossier } from './dossier.js';
 import {
   confirmationSignatureChecker,
+  readNoticeLines,
   getBundle,
   initStore,
   putBundle,
@@ -409,7 +410,7 @@ async function runCaseStore(args: string[]): Promise<void> {
       now: signedAtFrom(args),
       strict: evaluationOption(args, '--no-verify', 'nothing') === undefined,
     });
-    process.stderr.write(`${got.entry} revision ${got.revision} re-verified on read\n`);
+    for (const line of readNoticeLines(got)) process.stderr.write(`${line}\n`);
     process.stdout.write(`${JSON.stringify(got.bundle, null, 2)}\n`);
     return;
   }
