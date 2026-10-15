@@ -1,8 +1,22 @@
 import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { scanLocalWorkspace } from '../src/security.js';
+
+// Lets one test make a chosen file look like it was swapped for a symlink between the
+// directory listing and the read; every other read is the real thing.
+const swapped = vi.hoisted(() => ({ name: '' }));
+vi.mock('../src/bounded-read.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/bounded-read.js')>();
+  return {
+    ...actual,
+    readBoundedFile: (path: string, ...rest: [number, string]) =>
+      swapped.name && path.endsWith(swapped.name)
+        ? Promise.resolve({ kind: 'skipped', reason: 'symlink' })
+        : actual.readBoundedFile(path, ...rest),
+  };
+});
 
 const directories: string[] = [];
 
@@ -13,10 +27,22 @@ async function makeDirectory(): Promise<string> {
 }
 
 afterEach(async () => {
+  swapped.name = '';
   await Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
 describe('scanLocalWorkspace', () => {
+  it('reports truncated when a candidate is swapped for a symlink during the scan', async () => {
+    const root = await makeDirectory();
+    await writeFile(join(root, 'raced.py'), 'print(1)');
+    swapped.name = 'raced.py';
+
+    const result = await scanLocalWorkspace(root);
+
+    expect(result.truncated).toBe(true);
+    expect(result.filesScanned).toBe(0);
+  });
+
   it('reports high-confidence secret patterns without disclosing their values', async () => {
     const root = await makeDirectory();
     const token = `ghp_${'A'.repeat(36)}`;
