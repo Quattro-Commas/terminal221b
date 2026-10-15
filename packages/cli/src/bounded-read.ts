@@ -14,9 +14,12 @@ export type BoundedRead =
 // ELOOP also means a looping parent directory; that case is told apart below.
 const SYMLINK_OPEN_ERRORS = new Set(['ELOOP', 'EMLINK', 'EFTYPE']);
 
-// Same rule as the scanners' isWithinRoot ("..foo" is a name, not a parent), plus
-// isAbsolute for Windows paths on another drive. The root itself is not a file.
-function within(root: string, candidate: string): boolean {
+/**
+ * True when `candidate` is strictly inside `root` ("..foo" is a name, not a parent;
+ * isAbsolute catches Windows paths on another drive). The root itself is not inside.
+ * The one containment predicate shared by readBoundedFile and the scanners.
+ */
+export function isWithinRoot(root: string, candidate: string): boolean {
   const rel = relative(root, candidate);
   return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
@@ -105,7 +108,7 @@ export async function readBoundedFile(path: string, maxBytes: number, root: stri
 
     try {
       const { real, viaHandle } = await openedPath(path, handle.fd);
-      if (!within(root, real)) return { kind: 'skipped', reason: 'outside-root' };
+      if (!isWithinRoot(root, real)) return { kind: 'skipped', reason: 'outside-root' };
       // /proc names the file the handle holds, so a comparison adds nothing there (and
       // would turn a benign rename after the open into 'changed'). Only the path
       // re-resolution fallback needs the dev/ino check.

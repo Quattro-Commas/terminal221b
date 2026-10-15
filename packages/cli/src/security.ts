@@ -1,6 +1,6 @@
 import { lstat, readdir, realpath } from 'node:fs/promises';
 import { extname, join, relative, resolve, sep } from 'node:path';
-import { readBoundedFile } from './bounded-read.js';
+import { isWithinRoot, readBoundedFile } from './bounded-read.js';
 
 const ignoredDirectories = new Set([
   '.aws',
@@ -98,11 +98,6 @@ export interface LocalScanResult {
 const maxFiles = 10_000;
 const maxFileBytes = 1_000_000;
 const maxTotalBytes = 16_000_000;
-
-function isWithinRoot(root: string, candidate: string): boolean {
-  const pathFromRoot = relative(root, candidate);
-  return pathFromRoot === '' || (!pathFromRoot.startsWith(`..${sep}`) && pathFromRoot !== '..');
-}
 
 function shouldScanFile(name: string): boolean {
   return name.startsWith('.env') || sourceExtensions.has(extname(name).toLowerCase());

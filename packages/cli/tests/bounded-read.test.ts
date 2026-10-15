@@ -4,7 +4,7 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { readBoundedFile } from '../src/bounded-read.js';
+import { isWithinRoot, readBoundedFile } from '../src/bounded-read.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -150,5 +150,19 @@ describe('readBoundedFile', () => {
     } finally {
       await chmod(join(root, 'dir'), 0o755);
     }
+  });
+});
+
+describe('isWithinRoot', () => {
+  it('accepts descendants, including names that start with two dots', () => {
+    expect(isWithinRoot('/r', '/r/a.ts')).toBe(true);
+    expect(isWithinRoot('/r', '/r/..cache/a.ts')).toBe(true);
+  });
+
+  it('rejects the root itself, its parent and siblings', () => {
+    expect(isWithinRoot('/r', '/r')).toBe(false);
+    expect(isWithinRoot('/r', '/')).toBe(false);
+    expect(isWithinRoot('/r', '/r2/a.ts')).toBe(false);
+    expect(isWithinRoot('/r', '/r/../x')).toBe(false);
   });
 });

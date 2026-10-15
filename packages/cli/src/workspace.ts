@@ -1,6 +1,6 @@
 import { lstat, readdir, realpath } from 'node:fs/promises';
 import { extname, join, relative, resolve, sep } from 'node:path';
-import { readBoundedFile } from './bounded-read.js';
+import { isWithinRoot, readBoundedFile } from './bounded-read.js';
 
 const ignoredDirectories = new Set([
   '.git',
@@ -61,11 +61,6 @@ export interface WorkspaceContext {
   root: string;
   files: WorkspaceFile[];
   totalBytes: number;
-}
-
-function isWithinRoot(root: string, candidate: string): boolean {
-  const pathFromRoot = relative(root, candidate);
-  return pathFromRoot === '' || (!pathFromRoot.startsWith(`..${sep}`) && pathFromRoot !== '..');
 }
 
 function isIgnoredFile(name: string): boolean {
