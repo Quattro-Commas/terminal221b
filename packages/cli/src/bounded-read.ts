@@ -14,6 +14,7 @@ export interface BoundedReadDeps {
   linux?: boolean;
   open?: typeof open;
   realpath?: (path: string) => Promise<string>;
+  lstat?: (path: string) => Promise<{ isFile(): boolean }>;
 }
 
 // What open(O_NOFOLLOW) reports for a symlink: ELOOP on Linux and macOS, EMLINK on
@@ -129,10 +130,16 @@ export async function readBoundedFile(
     // macOS fails with errno 102, which libuv cannot even name), skip it; a real error
     // on a regular file still throws. The lstat decides only what to report; nothing
     // is opened after it.
-    const kind = await lstat(path).then((s) => (s.isFile() ? 'file' : 'other'), () => 'gone');
+    const kind = await (deps.lstat ?? lstat)(path).then(
+      (s) => (s.isFile() ? 'file' : 'other'),
+      (lstatError: NodeJS.ErrnoException) =>
+        lstatError.code === 'ENOENT' || lstatError.code === 'ENOTDIR' ? 'gone' : 'unknown'
+    );
     if (kind === 'other') return { kind: 'skipped', reason: 'not-a-regular-file' };
-    // Nothing there any more: deleted or a parent swapped between listing and open,
-    // the same race ENOENT/ENOTDIR already report as 'changed'.
+    // Nothing there any more (lstat says ENOENT/ENOTDIR): deleted or a parent swapped
+    // between listing and open, the same race ENOENT/ENOTDIR already report as
+    // 'changed'. Any other lstat failure (EIO, ENAMETOOLONG, ...) is not evidence of
+    // a race, so the original open error is raised.
     if (kind === 'gone') return { kind: 'skipped', reason: 'changed' };
     throw error;
   }

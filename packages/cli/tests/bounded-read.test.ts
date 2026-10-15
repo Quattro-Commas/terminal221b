@@ -275,6 +275,20 @@ describe('readBoundedFile', () => {
     });
   });
 
+  it('keeps the original error when the follow-up lstat also fails with a real error', async () => {
+    const root = await makeDirectory();
+    const eio = (message: string) => Object.assign(new Error(message), { code: 'EIO' });
+    const failingOpen = (async () => {
+      throw eio('open: input/output error');
+    }) as unknown as typeof open;
+    const failingLstat = async () => {
+      throw eio('lstat: input/output error');
+    };
+    await expect(
+      readBoundedFile(join(root, 'a.ts'), 100, root, { open: failingOpen, lstat: failingLstat })
+    ).rejects.toThrow('open: input/output error');
+  });
+
   it('still raises an error it does not understand, as readFile did', async () => {
     const root = await makeDirectory();
     await writeFile(join(root, 'a.ts'), 'x');
